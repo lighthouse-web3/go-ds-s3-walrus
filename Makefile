@@ -13,10 +13,10 @@ IPFS_VERSION ?= $(lastword $(shell $(GOCC) list -m github.com/ipfs/kubo))
 
 # make reproducible
 ifneq ($(findstring /,$(IPFS_VERSION)),)
-# Locally built go-ipfs
+# Locally built kubo
 GOFLAGS += -asmflags=all=-trimpath="$(GOPATH)" -gcflags=all=-trimpath="$(GOPATH)"
 else
-# Remote version of go-ipfs (e.g. via `go get -trimpath` or official distribution)
+# Remote version of kubo (e.g. via `go get -trimpath` or official distribution)
 GOFLAGS += -trimpath
 endif
 
@@ -27,12 +27,12 @@ go.mod: FORCE
 
 FORCE:
 
-walrus.so: plugin/main/main.go go.mod
-	CGO_ENABLED=1 $(GOCC) build $(GOFLAGS) -buildmode=plugin -o "$@" "$<"
+walrusplugin.so: plugin/main/main.go go.mod
+	$(GOCC) build $(GOFLAGS) -buildmode=plugin -o "$@" "$<"
 	chmod +x "$@"
 
-build: walrus.so
+build: walrusplugin.so
 	@echo "Built against" $(IPFS_VERSION)
 
 install: build
-	install -Dm700 walrus.so "$(IPFS_PATH)/plugins/go-ds-s3.so"
+	install -Dm700 walrusplugin.so "$(IPFS_PATH)/plugins/go-ds-s3-walrus.so"

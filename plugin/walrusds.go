@@ -1,18 +1,14 @@
-// Package plugin registers the Walrus datastore as a Kubo (IPFS) plugin.
-//
-// It is the bridge between Kubo's datastore plugin contract and the
-// walrusds package: it parses the relevant fields from the repo config map,
-// produces a fsrepo.DiskSpec for repo fingerprinting, and constructs a
-// concrete *walrusds.WalrusBucket on demand.
 package plugin
 
 import (
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/ipfs/kubo/plugin"
 	"github.com/ipfs/kubo/repo"
 	"github.com/ipfs/kubo/repo/fsrepo"
-	walrusds "github.com/lighthouse-web3/go-ds-s3"
+	walrusds "github.com/lighthouse-web3/go-ds-s3-walrus"
 )
 
 // Plugins is the symbol Kubo looks up when loading this shared object.
@@ -20,7 +16,8 @@ var Plugins = []plugin.Plugin{
 	&WalrusPlugin{},
 }
 
-// WalrusPlugin satisfies plugin.PluginDatastore for the "walrusds" type.
+// WalrusPlugin registers the "walrusds" datastore type: a Walrus-backed
+// datastore that keeps its key -> blob index in a shared Postgres database.
 type WalrusPlugin struct{}
 
 func (WalrusPlugin) Name() string {
@@ -39,97 +36,159 @@ func (WalrusPlugin) DatastoreTypeName() string {
 	return "walrusds"
 }
 
-// DatastoreConfigParser returns a parser that extracts the Walrus datastore
-// configuration from the Kubo repo config map.
+// DatastoreConfigParser parses the "walrusds" mount config from the Kubo repo
+// config.
 //
 // Required keys:
-//   - "aggregatorURL" (string)
-//   - "publisherURL"  (string)
-//   - "indexPath"     (string)
+//   - "publisherURL"  (string; comma-separated for failover)
+//   - "aggregatorURL" (string; comma-separated for failover)
+//   - "postgresURL"   (string; database/sql connection string)
 //
 // Optional keys:
-//   - "epochs"  (number, defaults to 1, must be a positive integer)
-//   - "workers" (number, batch concurrency; defaults to the walrusds package
-//     default when zero/omitted; must be a positive integer if specified)
+//   - "table"                 (string; index table, default "walrus_index")
+//   - "epochs"                (number; storage epochs to buy, default 1)
+//   - "deletable"             (bool;   register blobs as deletable)
+//   - "workers"               (number; batch concurrency)
+//   - "requestTimeoutSeconds" (number; per-attempt Walrus HTTP timeout)
+//   - "maxRetries"            (number; retries per Walrus request)
+//   - "epochDurationSeconds"  (number; wall-clock length of one epoch; enables renewal)
+//   - "renewIntervalSeconds"  (number; how often to scan for expiring blobs)
+//   - "renewLeadSeconds"      (number; how far ahead of expiry to renew)
 func (WalrusPlugin) DatastoreConfigParser() fsrepo.ConfigFromMap {
 	return func(m map[string]interface{}) (fsrepo.DatastoreConfig, error) {
-		aggregatorURL, ok := m["aggregatorURL"].(string)
-		if !ok || aggregatorURL == "" {
-			return nil, fmt.Errorf("walrusds: aggregatorURL is required")
+		publisher, err := requiredString(m, "publisherURL")
+		if err != nil {
+			return nil, err
+		}
+		aggregator, err := requiredString(m, "aggregatorURL")
+		if err != nil {
+			return nil, err
+		}
+		postgresURL, err := requiredString(m, "postgresURL")
+		if err != nil {
+			return nil, err
 		}
 
-		publisherURL, ok := m["publisherURL"].(string)
-		if !ok || publisherURL == "" {
-			return nil, fmt.Errorf("walrusds: publisherURL is required")
+		cfg := walrusds.Config{
+			PublisherURLs:  splitURLs(publisher),
+			AggregatorURLs: splitURLs(aggregator),
+			PostgresURL:    postgresURL,
 		}
 
-		indexPath, ok := m["indexPath"].(string)
-		if !ok || indexPath == "" {
-			return nil, fmt.Errorf("walrusds: indexPath is required")
-		}
-
-		epochs := 1
-		if v, ok := m["epochs"]; ok {
-			epochsf, ok := v.(float64)
+		if v, ok := m["table"]; ok {
+			s, ok := v.(string)
 			if !ok {
-				return nil, fmt.Errorf("walrusds: epochs is not a number")
+				return nil, fmt.Errorf("walrusds: table not a string")
 			}
-			epochs = int(epochsf)
-			switch {
-			case epochs <= 0:
-				return nil, fmt.Errorf("walrusds: epochs must be > 0: %f", epochsf)
-			case float64(epochs) != epochsf:
-				return nil, fmt.Errorf("walrusds: epochs is not an integer: %f", epochsf)
-			}
+			cfg.Table = s
 		}
 
-		workers := 0
-		if v, ok := m["workers"]; ok {
-			workersf, ok := v.(float64)
+		if v, ok := m["deletable"]; ok {
+			b, ok := v.(bool)
 			if !ok {
-				return nil, fmt.Errorf("walrusds: workers is not a number")
+				return nil, fmt.Errorf("walrusds: deletable not a boolean")
 			}
-			workers = int(workersf)
-			switch {
-			case workers <= 0:
-				return nil, fmt.Errorf("walrusds: workers must be > 0: %f", workersf)
-			case float64(workers) != workersf:
-				return nil, fmt.Errorf("walrusds: workers is not an integer: %f", workersf)
-			}
+			cfg.Deletable = b
 		}
 
-		return &WalrusConfig{
-			cfg: walrusds.Config{
-				AggregatorURL: aggregatorURL,
-				PublisherURL:  publisherURL,
-				IndexPath:     indexPath,
-				Epochs:        epochs,
-				Workers:       workers,
-			},
-		}, nil
+		if cfg.Epochs, err = optionalPositiveInt(m, "epochs"); err != nil {
+			return nil, err
+		}
+		if cfg.Workers, err = optionalPositiveInt(m, "workers"); err != nil {
+			return nil, err
+		}
+		if cfg.MaxRetries, err = optionalPositiveInt(m, "maxRetries"); err != nil {
+			return nil, err
+		}
+
+		secs, err := optionalPositiveInt(m, "requestTimeoutSeconds")
+		if err != nil {
+			return nil, err
+		}
+		cfg.RequestTimeout = time.Duration(secs) * time.Second
+
+		if secs, err = optionalPositiveInt(m, "epochDurationSeconds"); err != nil {
+			return nil, err
+		}
+		cfg.EpochDuration = time.Duration(secs) * time.Second
+
+		if secs, err = optionalPositiveInt(m, "renewIntervalSeconds"); err != nil {
+			return nil, err
+		}
+		cfg.RenewInterval = time.Duration(secs) * time.Second
+
+		if secs, err = optionalPositiveInt(m, "renewLeadSeconds"); err != nil {
+			return nil, err
+		}
+		cfg.RenewLead = time.Duration(secs) * time.Second
+
+		return &WalrusConfig{cfg: cfg}, nil
 	}
 }
 
-// WalrusConfig wraps the walrusds.Config so it satisfies
-// fsrepo.DatastoreConfig.
+func requiredString(m map[string]interface{}, key string) (string, error) {
+	v, ok := m[key].(string)
+	if !ok || v == "" {
+		return "", fmt.Errorf("walrusds: no %s specified", key)
+	}
+	return v, nil
+}
+
+// optionalPositiveInt parses an optional JSON number that, if present, must be
+// a positive integer. Missing keys yield 0 so the package defaults apply.
+func optionalPositiveInt(m map[string]interface{}, key string) (int, error) {
+	v, ok := m[key]
+	if !ok {
+		return 0, nil
+	}
+	f, ok := v.(float64)
+	if !ok {
+		return 0, fmt.Errorf("walrusds: %s not a number", key)
+	}
+	n := int(f)
+	switch {
+	case n <= 0:
+		return 0, fmt.Errorf("walrusds: %s <= 0: %f", key, f)
+	case float64(n) != f:
+		return 0, fmt.Errorf("walrusds: %s is not an integer: %f", key, f)
+	}
+	return n, nil
+}
+
+func splitURLs(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// WalrusConfig adapts walrusds.Config to fsrepo.DatastoreConfig.
 type WalrusConfig struct {
 	cfg walrusds.Config
 }
 
-// DiskSpec returns the fields that uniquely identify this datastore on
-// disk. Kubo uses this to detect config drift; we exclude epochs and workers
-// because they only affect runtime behaviour, not where blobs live.
+// DiskSpec uniquely identifies where this datastore's data lives, for Kubo's
+// repo fingerprinting. It deliberately omits the Postgres connection string
+// (which carries credentials) and runtime-only knobs; the publisher,
+// aggregator and table are enough to detect a backing-store change.
 func (wc *WalrusConfig) DiskSpec() fsrepo.DiskSpec {
+	table := wc.cfg.Table
+	if table == "" {
+		table = "walrus_index"
+	}
 	return fsrepo.DiskSpec{
-		"aggregatorURL": wc.cfg.AggregatorURL,
-		"publisherURL":  wc.cfg.PublisherURL,
-		"indexPath":     wc.cfg.IndexPath,
+		"publisherURL":  strings.Join(wc.cfg.PublisherURLs, ","),
+		"aggregatorURL": strings.Join(wc.cfg.AggregatorURLs, ","),
+		"table":         table,
 	}
 }
 
-// Create instantiates the underlying WalrusBucket. The path argument is the
-// repo path supplied by Kubo and is intentionally ignored: our on-disk
-// state lives at the configured IndexPath, not under the repo root.
+// Create instantiates the WalrusDatastore. The repo path is ignored: durable
+// state lives in Postgres and on Walrus, not under the repo root.
 func (wc *WalrusConfig) Create(path string) (repo.Datastore, error) {
 	return walrusds.NewWalrusDatastore(wc.cfg)
 }
