@@ -1,0 +1,45 @@
+FROM golang:1.23-bookworm AS builder
+
+ARG KUBO_VERSION=v0.26.0
+
+# CGO is required for leveldb/badger (Kubo + walrusds index)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ make git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CGO_ENABLED=1 \
+    GOCACHE=/tmp/go-build \
+    GOTMPDIR=/tmp/go-tmp
+
+RUN mkdir -p /tmp/go-build /tmp/go-tmp
+
+WORKDIR /work
+
+RUN git clone --depth 1 --branch ${KUBO_VERSION} https://github.com/ipfs/kubo.git /kubo
+
+COPY . /work/plugin-src
+
+WORKDIR /kubo
+
+# Register walrusds plugin (leading newline avoids gluing to previous preload_list line)
+RUN printf '\nwalrusds github.com/lighthouse-web3/go-ds-s3/plugin 0\n' >> plugin/loader/preload_list
+
+# Use local plugin source, not remote @latest
+RUN go mod edit -replace github.com/lighthouse-web3/go-ds-s3=/work/plugin-src \
+ && go get github.com/lighthouse-web3/go-ds-s3
+
+RUN make build
+
+# Runtime image
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /kubo/cmd/ipfs/ipfs /usr/local/bin/ipfs
+
+ENV IPFS_PATH=/data/ipfs
+EXPOSE 4001 5001 8080
+VOLUME ["/data/ipfs"]
+ENTRYPOINT ["ipfs"]
+CMD ["daemon", "--migrate=true", "--enable-gc"]
