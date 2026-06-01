@@ -109,9 +109,9 @@ In `$IPFS_DIR/config`, set the `/blocks` mount to `walrusds`:
         {
           "child": {
             "type": "walrusds",
-            "publisherURL": "https://publisher.walrus-mainnet.walrus.space",
-            "aggregatorURL": "https://aggregator.walrus-mainnet.walrus.space",
-            "postgresURL": "postgres://ipfs:CHANGE_ME@db-host:5432/walrusidx?sslmode=require",
+            "publisherURL": "https://publisher.walrus-testnet.walrus.space",
+            "aggregatorURL": "https://aggregator.walrus-testnet.walrus.space",
+            "postgresURL": "postgres://ipfs:CHANGE_ME@127.0.0.1:5432/walrusidx? sslmode=disable",
             "table": "walrus_index",
             "epochs": 53,
             "deletable": false,
@@ -138,7 +138,7 @@ Matching `$IPFS_DIR/datastore_spec` (brand-new repo only — **do not** do this 
 existing data):
 
 ```json
-{"mounts":[{"aggregatorURL":"https://aggregator.walrus-mainnet.walrus.space","publisherURL":"https://publisher.walrus-mainnet.walrus.space","table":"walrus_index","mountpoint":"/blocks"},{"mountpoint":"/","path":"datastore","type":"levelds"}],"type":"mount"}
+{"mounts":[{"aggregatorURL":"https://aggregator.walrus-testnet.walrus.space","mountpoint":"/blocks","publisherURL":"https://publisher.walrus-testnet.walrus.space","table":"walrus_index"},{"mountpoint":"/","path":"datastore","type":"levelds"}],"type":"mount"}
 ```
 
 Multiple nodes (e.g. an upload node and a retrieval node) share data by pointing the same
@@ -167,15 +167,23 @@ Overwrite `datastore_spec` (the on-disk fingerprint). **Only on a brand-new repo
 data** — overwriting this on a populated repo orphans existing blocks:
 
 ```dockerfile
-RUN echo "{\"mounts\":[{\"aggregatorURL\":\"${WALRUS_AGGREGATOR_URL}\",\"publisherURL\":\"${WALRUS_PUBLISHER_URL}\",\"table\":\"walrus_index\",\"mountpoint\":\"/blocks\"},{\"mountpoint\":\"/\",\"path\":\"datastore\",\"type\":\"levelds\"}],\"type\":\"mount\"}" > $IPFS_PATH/datastore_spec
+RUN echo "{\"mounts\":[{\"aggregatorURL\":\"${WALRUS_AGGREGATOR_URL}\",\"mountpoint\":\"/blocks\",\"publisherURL\":\"${WALRUS_PUBLISHER_URL}\",\"table\":\"walrus_index\"},{\"mountpoint\":\"/\",\"path\":\"datastore\",\"type\":\"levelds\"}],\"type\":\"mount\"}" > $IPFS_PATH/datastore_spec
 ```
 
 > **Critical:** the `datastore_spec` entry for `/blocks` must contain exactly the datastore's
 > `DiskSpec` keys — `publisherURL`, `aggregatorURL`, and `table` — and **must not** include
 > `postgresURL` (it carries credentials and is deliberately excluded from the fingerprint).
 > If the spec doesn't match what the plugin computes, Kubo refuses to start with a
-> "datastore configuration does not match what is on disk" error. Key order does not matter
-> (Kubo normalizes before comparing); the set of keys does.
+> "datastore configuration does not match what is on disk" error.
+>
+> **Key order matters.** Kubo computes the expected spec by JSON-marshaling a Go `map`, which
+> always emits keys in **alphabetical order**, and compares it against the raw bytes of this
+> file. So every object's keys must be alphabetized: the `/blocks` mount is
+> `aggregatorURL, mountpoint, publisherURL, table` (note `mountpoint` is injected by the mount
+> wrapper and sorts in), and the root mount is `mountpoint, path, type`. The simplest way to
+> avoid mistakes is to **let `ipfs init` generate `datastore_spec` for you** and only hand-write
+> it when scripting a brand-new repo (as above), copying the exact string Kubo reports as the
+> expected value in any mismatch error.
 
 Notes:
 - Run these after `ipfs init` and with `IPFS_PATH` set.
