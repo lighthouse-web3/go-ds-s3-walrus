@@ -8,7 +8,8 @@ import (
 )
 
 // renewBatchSize bounds how many expiring blobs are processed per scan so a
-// single tick cannot monopolize the publisher.
+// single tick cannot monopolize the publisher. With block-packing this counts
+// distinct blobs, so one entry can cover many IPFS blocks.
 const renewBatchSize = 256
 
 // startRenewalWorker launches the background goroutine that keeps Walrus
@@ -53,18 +54,19 @@ func (w *WalrusDatastore) renewExpiring(ctx context.Context, lead time.Duration)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := w.renewOne(ctx, it); err != nil {
-			log.Printf("walrusds: renewing key %s (blob %s): %v", it.Key, it.BlobID, err)
+		if err := w.renewOneBlob(ctx, it); err != nil {
+			log.Printf("walrusds: renewing blob %s: %v", it.BlobID, err)
 		}
 	}
 	return nil
 }
 
-// renewOne re-uploads a single blob's bytes and points the index at the new
-// blob ID. We read the existing bytes from the aggregator and store them
-// again; this needs only the HTTP API (no Sui key) at the cost of one
-// round-trip per blob near expiry.
-func (w *WalrusDatastore) renewOne(ctx context.Context, it RenewItem) error {
+// renewOneBlob re-uploads a single (possibly packed) blob's bytes and points
+// every block that lived in it at the refreshed blob. We read the whole blob
+// from the aggregator and store it again; this needs only the HTTP API (no Sui
+// key) at the cost of one round-trip per blob near expiry, regardless of how
+// many IPFS blocks the blob holds.
+func (w *WalrusDatastore) renewOneBlob(ctx context.Context, it RenewItem) error {
 	data, err := w.client.Read(ctx, it.BlobID)
 	if err != nil {
 		return err
@@ -81,5 +83,5 @@ func (w *WalrusDatastore) renewOne(ctx context.Context, it RenewItem) error {
 			Valid: true,
 		}
 	}
-	return w.index.UpdateAfterRenewal(ctx, it.Key, res.BlobID, res.EndEpoch, expiresAt)
+	return w.index.UpdateBlobAfterRenewal(ctx, it.BlobID, res.BlobID, res.EndEpoch, expiresAt)
 }
