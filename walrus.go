@@ -33,6 +33,20 @@ const (
 	defaultEpochs         = 1
 	defaultRequestTimeout = 60 * time.Second
 	defaultMaxRetries     = 3
+	// defaultPackTargetSize is the target (maximum) size of a packed Walrus
+	// blob. It is a ceiling, not a floor: Batch.Commit flushes whatever it has
+	// buffered, so a small file still uploads immediately as a smaller blob.
+	// 64 MiB amortizes the per-blob Walrus cost (Sui gas + WAL minimums +
+	// erasure-coding overhead) across many blocks while staying well within
+	// memory and read-amplification limits. Public Walrus services cap
+	// requests near 10 MiB, so packs this large require a self-hosted
+	// publisher/aggregator (expected on mainnet anyway).
+	defaultPackTargetSize = 64 << 20 // 64 MiB
+	// defaultBlobCacheBytes is the default in-memory budget for caching whole
+	// blobs to serve range reads of packed blocks. Sized so a single
+	// default-target pack (64 MiB) stays cacheable (per-entry cap is a quarter
+	// of the budget).
+	defaultBlobCacheBytes = 256 << 20 // 256 MiB
 )
 
 var (
@@ -61,6 +75,17 @@ type Config struct {
 	Deletable bool
 	// Workers is the Batch.Commit() concurrency. Defaults to defaultWorkers.
 	Workers int
+
+	// PackTargetSize is the target size (in bytes) of a packed Walrus blob.
+	// During Batch.Commit, blocks are concatenated into packfiles up to this
+	// size and uploaded as a single blob, amortizing the per-blob Walrus cost
+	// (Sui gas + WAL minimums) across many IPFS blocks. A block larger than
+	// this gets its own blob. Defaults to defaultPackTargetSize.
+	PackTargetSize int64
+	// BlobCacheBytes is the byte budget for the in-memory LRU of whole blobs
+	// used to serve range reads of packed blocks. Defaults to
+	// defaultBlobCacheBytes; a negative value disables the cache.
+	BlobCacheBytes int64
 
 	// RequestTimeout bounds a single Walrus HTTP attempt. Defaults to 60s.
 	RequestTimeout time.Duration
@@ -116,6 +141,17 @@ func NewWalrusDatastore(conf Config) (*WalrusDatastore, error) {
 	if conf.MaxRetries < 0 {
 		conf.MaxRetries = defaultMaxRetries
 	}
+	if conf.PackTargetSize <= 0 {
+		conf.PackTargetSize = defaultPackTargetSize
+	}
+	// A negative BlobCacheBytes explicitly disables caching; zero means default.
+	cacheBytes := conf.BlobCacheBytes
+	switch {
+	case cacheBytes == 0:
+		cacheBytes = defaultBlobCacheBytes
+	case cacheBytes < 0:
+		cacheBytes = 0
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -130,6 +166,7 @@ func NewWalrusDatastore(conf Config) (*WalrusDatastore, error) {
 		AggregatorURLs: conf.AggregatorURLs,
 		RequestTimeout: conf.RequestTimeout,
 		MaxRetries:     conf.MaxRetries,
+		BlobCacheBytes: cacheBytes,
 	})
 
 	w := &WalrusDatastore{
@@ -170,6 +207,7 @@ func (w *WalrusDatastore) Put(ctx context.Context, k ds.Key, value []byte) error
 
 	rec := Record{
 		BlobID:    res.BlobID,
+		Offset:    0,
 		Size:      int64(len(value)),
 		Deletable: w.conf.Deletable,
 		EndEpoch:  res.EndEpoch,
@@ -192,7 +230,7 @@ func (w *WalrusDatastore) Get(ctx context.Context, k ds.Key) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	data, err := w.client.Read(ctx, rec.BlobID)
+	data, err := w.client.ReadRange(ctx, rec.BlobID, rec.Offset, rec.Size)
 	if err != nil {
 		if err == ErrBlobNotFound {
 			return nil, ds.ErrNotFound
@@ -320,49 +358,75 @@ func (b *walrusBatch) Delete(ctx context.Context, k ds.Key) error {
 	return nil
 }
 
+// blockEntry is one block staged for packing.
+type blockEntry struct {
+	key string
+	val []byte
+}
+
+// Commit groups the buffered Puts into packed Walrus blobs (concatenating
+// blocks up to PackTargetSize and uploading each pack as a single blob), then
+// applies the buffered Deletes. Packs are uploaded concurrently; each pack
+// keeps the Walrus-first ordering invariant: the blob is stored before its
+// index rows are written, so a failure leaks a recoverable blob rather than
+// leaving a dangling index row.
 func (b *walrusBatch) Commit(ctx context.Context) error {
-	numJobs := len(b.ops)
-	if numJobs == 0 {
-		return nil
+	var (
+		puts    []blockEntry
+		deletes []string
+	)
+	for key, op := range b.ops {
+		if op.isDelete {
+			deletes = append(deletes, key)
+		} else {
+			puts = append(puts, blockEntry{key: key, val: op.val})
+		}
 	}
 
-	jobs := make(chan func() error, numJobs)
-	results := make(chan error, numJobs)
+	packs := buildPacks(puts, b.w.conf.PackTargetSize)
+
+	jobs := make([]func() error, 0, len(packs)+1)
+	for _, pack := range packs {
+		pack := pack
+		jobs = append(jobs, func() error { return b.w.storePack(ctx, pack) })
+	}
+	if len(deletes) > 0 {
+		jobs = append(jobs, func() error { return b.w.index.DeleteMany(ctx, deletes) })
+	}
+	if len(jobs) == 0 {
+		return nil
+	}
 
 	numWorkers := b.numWorkers
 	if numWorkers <= 0 {
 		numWorkers = defaultWorkers
 	}
-	if numJobs < numWorkers {
-		numWorkers = numJobs
+	if len(jobs) < numWorkers {
+		numWorkers = len(jobs)
 	}
 
+	jobCh := make(chan func() error, len(jobs))
+	results := make(chan error, len(jobs))
 	var wg sync.WaitGroup
 	wg.Add(numWorkers)
-	defer wg.Wait()
 	for i := 0; i < numWorkers; i++ {
 		go func() {
 			defer wg.Done()
-			for j := range jobs {
+			for j := range jobCh {
 				results <- j()
 			}
 		}()
 	}
-
-	for key, op := range b.ops {
-		k := ds.NewKey(key)
-		if op.isDelete {
-			jobs <- func() error { return b.w.Delete(ctx, k) }
-		} else {
-			val := op.val
-			jobs <- func() error { return b.w.Put(ctx, k, val) }
-		}
+	for _, j := range jobs {
+		jobCh <- j
 	}
-	close(jobs)
+	close(jobCh)
+	wg.Wait()
+	close(results)
 
 	var errs []string
-	for i := 0; i < numJobs; i++ {
-		if err := <-results; err != nil {
+	for err := range results {
+		if err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
@@ -370,4 +434,73 @@ func (b *walrusBatch) Commit(ctx context.Context) error {
 		return fmt.Errorf("walrusds: failed batch operation:\n%s", strings.Join(errs, "\n"))
 	}
 	return nil
+}
+
+// buildPacks greedily groups blocks into packs no larger than target bytes. A
+// single block bigger than target gets its own pack (it cannot be split).
+func buildPacks(puts []blockEntry, target int64) [][]blockEntry {
+	if target <= 0 {
+		target = defaultPackTargetSize
+	}
+	var (
+		packs   [][]blockEntry
+		cur     []blockEntry
+		curSize int64
+	)
+	for _, e := range puts {
+		sz := int64(len(e.val))
+		if len(cur) > 0 && curSize+sz > target {
+			packs = append(packs, cur)
+			cur = nil
+			curSize = 0
+		}
+		cur = append(cur, e)
+		curSize += sz
+	}
+	if len(cur) > 0 {
+		packs = append(packs, cur)
+	}
+	return packs
+}
+
+// storePack concatenates a pack's blocks into one blob, uploads it to Walrus,
+// then records each block's byte range in the index in a single transaction.
+func (w *WalrusDatastore) storePack(ctx context.Context, pack []blockEntry) error {
+	if len(pack) == 0 {
+		return nil
+	}
+
+	var total int64
+	for _, e := range pack {
+		total += int64(len(e.val))
+	}
+
+	buf := make([]byte, 0, total)
+	recs := make([]KeyRecord, len(pack))
+	var offset int64
+	for i, e := range pack {
+		buf = append(buf, e.val...)
+		recs[i] = KeyRecord{
+			Key: e.key,
+			Rec: Record{
+				Offset: offset,
+				Size:   int64(len(e.val)),
+			},
+		}
+		offset += int64(len(e.val))
+	}
+
+	res, err := w.client.Store(ctx, buf, w.conf.Epochs, w.conf.Deletable)
+	if err != nil {
+		return fmt.Errorf("walrusds: storing pack of %d blocks: %w", len(pack), err)
+	}
+
+	expiry := w.expiry()
+	for i := range recs {
+		recs[i].Rec.BlobID = res.BlobID
+		recs[i].Rec.Deletable = w.conf.Deletable
+		recs[i].Rec.EndEpoch = res.EndEpoch
+		recs[i].Rec.ExpiresAt = expiry
+	}
+	return w.index.PutMany(ctx, recs)
 }
