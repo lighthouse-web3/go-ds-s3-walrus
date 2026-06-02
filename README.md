@@ -37,31 +37,56 @@ Created automatically on first start:
 
 ```sql
 CREATE TABLE walrus_index (
-  key        TEXT PRIMARY KEY,   -- ds.Key string, e.g. "/blocks/CIQ..."
-  blob_id    TEXT NOT NULL,      -- Walrus blob ID
-  size       BIGINT NOT NULL,
-  deletable  BOOLEAN NOT NULL DEFAULT FALSE,
-  end_epoch  BIGINT NOT NULL DEFAULT 0,
-  expires_at TIMESTAMPTZ,        -- used by the renewal worker
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  key         TEXT PRIMARY KEY,   -- ds.Key string, e.g. "/blocks/CIQ..."
+  blob_id     TEXT NOT NULL,      -- Walrus blob ID (shared across packed blocks)
+  blob_offset BIGINT NOT NULL DEFAULT 0, -- byte offset of this block within the blob
+  size        BIGINT NOT NULL,    -- block length; the block is blob[offset : offset+size]
+  deletable   BOOLEAN NOT NULL DEFAULT FALSE,
+  end_epoch   BIGINT NOT NULL DEFAULT 0,
+  expires_at  TIMESTAMPTZ,        -- used by the renewal worker
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
 
+**Block packing.** To amortize Walrus's per-blob cost (Sui gas + WAL minimums + erasure-coding
+overhead), `Batch.Commit` concatenates many IPFS blocks into one Walrus blob (a "packfile") up
+to `packTargetSizeBytes` (default 64 MiB), so several `key` rows share a `blob_id` and are
+distinguished by `blob_offset`/`size`. `Get` reads only its slice via an HTTP `Range` request
+(falling back to a cached whole-blob slice if the aggregator ignores `Range`). Existing repos
+upgrade transparently: the `blob_offset` column is added with default `0`, so legacy
+one-blob-per-block rows keep working unchanged.
+
+`packTargetSizeBytes` is a **ceiling, not a floor** — a small file uploads immediately as a
+smaller blob and never waits to fill. The plugin can only pack the blocks delivered in one
+`Batch.Commit`, which Kubo bounds by `Import.BatchMaxSize` (default ~8 MiB on Kubo <0.33;
+configurable on v0.33+, where it is additionally divided by `runtime.NumCPU()`). To get large
+packs, set `Import.BatchMaxSize ≈ packTargetSizeBytes × NumCPU` and raise `Import.BatchMaxNodes`.
+Pairs well with raising the IPFS chunk size to 1 MiB (the max interoperable block size; clean on
+Kubo v0.40+). Measure the realized ratio with
+`SELECT count(*), count(DISTINCT blob_id) FROM walrus_index;`.
+
 ## Building and Installing
 
+This plugin is **not pinned to a single Kubo release.** The `go.mod` carries a baseline
+version, but the build is retargeted to whatever Kubo you point it at — so pick the
+`KUBO_VERSION` you need and the tooling aligns the dependency graph to match.
+
 Build the plugin with the _exact_ Go version used to build your Kubo binary, against the
-matching Kubo version. Example Dockerfile flow (Kubo v0.30.0):
+matching Kubo version. Substitute the tag you want for `${KUBO_VERSION}` below (and use the
+Go toolchain that Kubo's own `go.mod` requires for that tag — newer Kubo lines need newer Go):
 
 ```dockerfile
+ARG KUBO_VERSION=v0.30.0
+
 RUN git clone https://github.com/ipfs/kubo && \
     cd kubo && \
-    git checkout v0.30.0 && \
+    git checkout ${KUBO_VERSION} && \
     go get github.com/lighthouse-web3/go-ds-s3-walrus/plugin@latest
 
 RUN cd kubo && \
     echo "\nwalrusds github.com/lighthouse-web3/go-ds-s3-walrus/plugin 0" >> plugin/loader/preload_list && \
-    make build && \
+    go mod edit -require=github.com/lighthouse-web3/go-ds-s3-walrus@v0.0.0 && \
     go mod tidy && \
     make build && \
     cp cmd/ipfs/ipfs /usr/local/bin/ipfs
@@ -69,11 +94,19 @@ RUN cd kubo && \
 
 Notes:
 - The preload `name` token (`walrusds`) is just a label; the import path is what matters.
-- The first `make build` may fail until `go mod tidy` resolves deps — run `make build` again.
+- Kubo needs the plugin module both `require`d and `replace`d/`get`-resolved; the explicit
+  `go mod edit -require=...@v0.0.0` + `go mod tidy` avoids the
+  "is replaced but not required" build error.
 - Pure Go (Postgres driver `lib/pq`); no CGO required.
 
-To build/install the `.so` locally instead: `make install` (drops
-`walrusplugin.so` into `$IPFS_PATH/plugins/go-ds-s3-walrus.so`).
+To build/install the `.so` locally instead: `make install` (drops `walrusplugin.so` into
+`$IPFS_PATH/plugins/go-ds-s3-walrus.so`). Retarget the Kubo version with the `IPFS_VERSION`
+variable, which rewrites `go.mod`/`go.sum` to that release via `set-target.sh`:
+
+```bash
+make install IPFS_VERSION=v0.30.0       # build against a published Kubo tag
+make install IPFS_VERSION=/path/to/kubo # build against a local Kubo checkout
+```
 
 ## Provisioning Postgres
 
@@ -202,7 +235,9 @@ Notes:
 | `table` | no | `walrus_index` | Index table name. |
 | `epochs` | no | `1` | Storage epochs to purchase per blob. **Set this high** (see below). |
 | `deletable` | no | `false` | Register blobs as deletable on Walrus. |
-| `workers` | no | `100` | Concurrency for `Batch().Commit()`. |
+| `workers` | no | `100` | Concurrency for `Batch().Commit()` (packfile uploads run in parallel). |
+| `packTargetSizeBytes` | no | `67108864` (64 MiB) | **Ceiling** for a packed Walrus blob: blocks in one `Batch.Commit` are concatenated up to this size and stored as one blob (a smaller commit uploads immediately as a smaller blob — it never waits to fill). Packs >10 MiB require a self-hosted publisher/aggregator (public services cap requests near 10 MiB). The realized pack size is also bounded by Kubo's `Import.BatchMaxSize` (see below). |
+| `blobCacheBytes` | no | `268435456` (256 MiB) | In-memory LRU budget for whole blobs, used to serve range reads of packed blocks. Per-entry cap is ¼ of this, so the default keeps a 64 MiB pack cacheable. A negative value disables the cache. |
 | `requestTimeoutSeconds` | no | `60` | Per-attempt Walrus HTTP timeout. |
 | `maxRetries` | no | `3` | Retries per Walrus request (exponential backoff). |
 | `epochDurationSeconds` | no | `0` | Wall-clock length of one Walrus epoch. Enables the renewal worker when set. |
@@ -227,9 +262,14 @@ The default `epochs: 1` expires quickly — fine for testing, **not** for produc
 ## Limitations
 
 - `Delete` removes the Postgres row only; it does not delete the blob on Walrus (on-chain
-  deletion needs a Sui key, out of scope). Unreferenced blobs simply expire.
-- One IPFS block maps to one Walrus blob — correct but not cost-optimal for many tiny blocks.
-  Block-packing is planned; the schema has room for it.
+  deletion needs a Sui key, out of scope). Unreferenced blobs simply expire. With packing, a
+  deleted block's bytes also remain inside its shared blob until the whole blob expires —
+  reclaiming that space would need a future compaction/GC pass.
+- Block-packing batches blocks written through `Batch().Commit()` (e.g. `ipfs add`). A single
+  `Put` outside a batch still writes one blob per block, since a lone `Put` must be durable on
+  return.
+- Read efficiency on packed blobs depends on the aggregator honoring HTTP `Range`; otherwise
+  the whole blob is fetched once and cached (`blobCacheBytes`).
 - `Query` does not support `Orders` or `Filters` (same as the S3 datastore).
 
 ## License

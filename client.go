@@ -40,6 +40,7 @@ type Client struct {
 	aggregators []string
 	http        *http.Client
 	maxRetries  int
+	cache       *blobCache
 }
 
 // ClientConfig configures a Walrus Client.
@@ -56,6 +57,9 @@ type ClientConfig struct {
 	// MaxRetries is the number of additional attempts (per endpoint set) on
 	// transient failures. Zero means a single attempt.
 	MaxRetries int
+	// BlobCacheBytes is the byte budget for the in-memory LRU of whole blobs
+	// used to satisfy range reads of packed blocks. Zero disables the cache.
+	BlobCacheBytes int64
 }
 
 // NewClient builds a Walrus client from the supplied configuration.
@@ -65,6 +69,7 @@ func NewClient(conf ClientConfig) *Client {
 		aggregators: normalizeURLs(conf.AggregatorURLs),
 		http:        &http.Client{Timeout: conf.RequestTimeout},
 		maxRetries:  conf.MaxRetries,
+		cache:       newBlobCache(conf.BlobCacheBytes),
 	}
 }
 
@@ -160,6 +165,98 @@ func (c *Client) Read(ctx context.Context, blobID string) ([]byte, error) {
 		return data, nil
 	}
 	return nil, fmt.Errorf("walrusds: read failed on all aggregators: %w", lastErr)
+}
+
+// ReadRange fetches the bytes [offset, offset+length) of the blob identified
+// by blobID. It first issues an HTTP Range request so only the requested
+// block travels over the wire. If the aggregator ignores the Range header and
+// returns the whole blob (HTTP 200), the full body is cached and sliced
+// locally, so packed blocks remain cheap to read even without range support.
+func (c *Client) ReadRange(ctx context.Context, blobID string, offset, length int64) ([]byte, error) {
+	if length == 0 {
+		return []byte{}, nil
+	}
+	if len(c.aggregators) == 0 {
+		return nil, errors.New("walrusds: no aggregator URLs configured")
+	}
+
+	if full, ok := c.cache.get(blobID); ok {
+		return sliceBlob(full, offset, length)
+	}
+
+	rangeHdr := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+
+	var lastErr error
+	for _, base := range c.aggregators {
+		endpoint := base + "/v1/blobs/" + url.PathEscape(blobID)
+
+		res, err := c.doWithRetry(ctx, func() (*http.Response, error) {
+			req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+			if rerr != nil {
+				return nil, rerr
+			}
+			req.Header.Set("Range", rangeHdr)
+			return c.http.Do(req)
+		})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		data, rerr := c.readRangeResponse(res, blobID, offset, length)
+		if rerr != nil {
+			if errors.Is(rerr, ErrBlobNotFound) {
+				return nil, ErrBlobNotFound
+			}
+			lastErr = rerr
+			continue
+		}
+		return data, nil
+	}
+	return nil, fmt.Errorf("walrusds: range read failed on all aggregators: %w", lastErr)
+}
+
+func (c *Client) readRangeResponse(res *http.Response, blobID string, offset, length int64) ([]byte, error) {
+	defer res.Body.Close()
+	switch {
+	case res.StatusCode == http.StatusNotFound:
+		return nil, ErrBlobNotFound
+	case res.StatusCode == http.StatusPartialContent:
+		body, err := io.ReadAll(res.Body)
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(body)) != length {
+			return nil, fmt.Errorf("walrusds: aggregator returned %d partial bytes, want %d", len(body), length)
+		}
+		return body, nil
+	case res.StatusCode >= 200 && res.StatusCode < 300:
+		// Range header ignored: the aggregator returned the whole blob.
+		body, err := io.ReadAll(res.Body)
+		if err != nil {
+			return nil, err
+		}
+		c.cache.add(blobID, body)
+		return sliceBlob(body, offset, length)
+	default:
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 512))
+		return nil, fmt.Errorf("walrusds: aggregator returned %d: %s", res.StatusCode, strings.TrimSpace(string(body)))
+	}
+}
+
+// sliceBlob returns a copy of full[offset:offset+length], clamped to the blob
+// length. It copies so callers can't mutate cached blob bytes.
+func sliceBlob(full []byte, offset, length int64) ([]byte, error) {
+	if offset < 0 || offset > int64(len(full)) {
+		return nil, fmt.Errorf("walrusds: offset %d out of range for %d-byte blob", offset, len(full))
+	}
+	end := offset + length
+	if end > int64(len(full)) {
+		end = int64(len(full))
+	}
+	out := make([]byte, end-offset)
+	copy(out, full[offset:end])
+	return out, nil
 }
 
 func readBlobResponse(res *http.Response) ([]byte, error) {

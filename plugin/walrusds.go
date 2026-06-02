@@ -51,6 +51,8 @@ func (WalrusPlugin) DatastoreTypeName() string {
 //   - "workers"               (number; batch concurrency)
 //   - "requestTimeoutSeconds" (number; per-attempt Walrus HTTP timeout)
 //   - "maxRetries"            (number; retries per Walrus request)
+//   - "packTargetSizeBytes"   (number; target packed-blob size, default 8 MiB)
+//   - "blobCacheBytes"        (number; LRU budget for range reads, default 128 MiB)
 //   - "epochDurationSeconds"  (number; wall-clock length of one epoch; enables renewal)
 //   - "renewIntervalSeconds"  (number; how often to scan for expiring blobs)
 //   - "renewLeadSeconds"      (number; how far ahead of expiry to renew)
@@ -100,6 +102,18 @@ func (WalrusPlugin) DatastoreConfigParser() fsrepo.ConfigFromMap {
 		if cfg.MaxRetries, err = optionalPositiveInt(m, "maxRetries"); err != nil {
 			return nil, err
 		}
+
+		packBytes, err := optionalPositiveInt(m, "packTargetSizeBytes")
+		if err != nil {
+			return nil, err
+		}
+		cfg.PackTargetSize = int64(packBytes)
+
+		cacheBytes, err := optionalPositiveInt(m, "blobCacheBytes")
+		if err != nil {
+			return nil, err
+		}
+		cfg.BlobCacheBytes = int64(cacheBytes)
 
 		secs, err := optionalPositiveInt(m, "requestTimeoutSeconds")
 		if err != nil {
