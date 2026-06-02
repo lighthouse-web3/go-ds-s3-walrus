@@ -1,5 +1,0 @@
-.git
-main
-walrus.so
-*.test
-**/*_test.go
