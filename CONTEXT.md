@@ -37,13 +37,28 @@ We worked through several options before landing here:
 - `Has` / `GetSize` / `Query` answered from Postgres only; only `Get` hits Walrus.
 - Walrus-first, index-second write ordering (a failure leaks a recoverable blob, never a
   dangling index row).
-- **Block packing (v2):** `Batch.Commit` concatenates blocks into packfiles up to
-  `PackTargetSize` (default **64 MiB**) and uploads each as one Walrus blob. Many keys can share
-  a `blob_id`; each row stores the block's byte range `[blob_offset, blob_offset+size)`. `Get`
-  fetches only that range via an HTTP `Range` request, with a whole-blob fallback + a
-  byte-bounded LRU cache (`BlobCacheBytes`, default **256 MiB**, sized so a 64 MiB pack stays
-  cacheable). Single (non-batch) `Put` still writes one blob per block (`blob_offset = 0`).
-  Fully backward-compatible: legacy rows are `blob_offset = 0`, `size` = whole blob.
+- **Block packing (v3 — Walrus Quilt):** `Batch.Commit` groups blocks into packs up to
+  `PackTargetSize` (default **64 MiB**) **and** at most **666** blocks (the QuiltV1 member limit),
+  then stores each pack as a single Walrus **quilt** via the publisher's `PUT /v1/quilts`
+  (multipart, one file part per block; identifier = block's index in the pack). The store
+  response returns the quilt's own `blobId` plus a `quiltPatchId` per member. Each index row
+  records `blob_id` = quilt ID (for renewal grouping) and `patch_id` = `QuiltPatchID`. `Get`
+  dispatches on `patch_id`: non-empty → read the member via the aggregator's
+  `GET /v1/blobs/by-quilt-patch-id/{id}` (only that member's slivers transfer), empty → legacy
+  byte-range read. A byte-bounded LRU (`BlobCacheBytes`, default **256 MiB**) caches patch bytes
+  (keyed by patch ID) and whole blobs (keyed by blob ID). Quilt is the **native** equivalent of
+  the old manual concat packing and is dramatically cheaper for small blobs (docs cite >400x for
+  ~10 KiB files) because it shares the per-blob overhead (Sui storage object, gas,
+  erasure-coding metadata) across all members.
+  - Single (non-batch) `Put`, and any pack that ends up with exactly **one** block, still write
+    one plain blob (`patch_id = ''`, `blob_offset = 0`) — a quilt of one isn't worth it.
+  - **Legacy concat packing is retained** behind `disableQuilt: true` (`Config.DisableQuilt`):
+    blocks are concatenated into one opaque blob and read back by byte range. Fully
+    backward-compatible: pre-quilt rows (`patch_id = ''`, with a byte range) and pre-packing
+    rows (`blob_offset = 0`, `size` = whole blob) keep working unchanged.
+  - Quilts are **immutable** and quilt-level only: `delete`/`extend` can't target a single
+    member. `QuiltPatchId` is composition-dependent (not content-addressed), so it changes if a
+    block is repacked into a different quilt. Retrieval is one member per request (no bulk read).
 - **`PackTargetSize` is a ceiling, not a floor:** `Commit` flushes whatever is buffered, so a
   small file uploads immediately as a smaller blob — it never waits to fill. The plugin can only
   pack what arrives in one `Commit`; we deliberately do **not** coalesce across commits because
@@ -55,10 +70,43 @@ We worked through several options before landing here:
   `Import.UnixFSChunker = size-1048576` (1 MiB). Sweet spot is ~32–64 MiB (diminishing per-blob
   cost savings vs. rising memory/read-amplification beyond that); Walrus max blob size is
   13.6 GiB.
-- **Epoch renewal via re-upload** (HTTP-only, no Sui key): background worker re-uploads blobs
-  near `expires_at`, **per distinct `blob_id`** (so a packed blob is renewed once, not once per
-  block), then repoints all member rows. Enabled when `epochDurationSeconds` +
-  `renewIntervalSeconds` are set.
+- **Epoch renewal via re-upload** (HTTP-only, no Sui key): re-uploads blobs **per distinct
+  `blob_id`** (so a packed blob / quilt is renewed once, not once per block), then repoints all
+  member rows. Two ways to drive it, sharing one core (`renewBlob` in `renewal.go`):
+  - **Automatic (opt-in):** background worker, enabled only when `epochDurationSeconds` +
+    `renewIntervalSeconds` are set. It scans `expires_at` and renews everything due. **Leave
+    these unset to disable auto-renewal** (the common choice when the operator wants to renew
+    selectively, e.g. only paying users).
+  - **Manual / external (default for selective renewal):** the Node.js script `js/renew.js`
+    (`pg` + `multiformats`), the supported tool for selective renewal. (The former Go
+    `Renewer`/`cmd/walrus-renew` were removed in favor of the JS scripts, which now live in
+    `js/` at the repo root — a sibling of this Go module.) The operator supplies the CIDs (or raw
+    datastore keys) to keep alive; the tool resolves them to distinct Walrus blobs and re-uploads
+    each. Connects straight to Postgres + Walrus, no running Kubo node needed. To renew whole
+    files, expand each root CID to all its block CIDs first
+    (`( echo "$ROOT"; ipfs refs -r "$ROOT" ) | node renew.js ...`). CID→key mapping is base32 of
+    the multihash with a configurable `--key-prefix` (default "", i.e. blocks datastore mounted at
+    `/blocks`; use `/blocks` if walrusds is the root datastore).
+  - **Packing caveat for per-user billing:** renewing one key renews its *whole* backing blob,
+    including any other users' blocks packed in the same quilt/pack. For strict per-user
+    accounting, keep each user's blocks in separate commits so they land in separate quilts. For a quilt, `blob_id` is the quilt ID; the worker reads the
+  whole quilt blob (`GET /v1/blobs/{quiltId}`) and re-stores the identical bytes
+  (`PUT /v1/blobs`). Because Walrus blob IDs are content-derived, the re-uploaded quilt keeps the
+  **same** quilt ID, and member `QuiltPatchId`s (quilt ID + position) are therefore unchanged —
+  so existing `patch_id` rows stay valid and only `end_epoch`/`expires_at` are refreshed.
+  Alternative for operators with a funded Sui key + CLI: `walrus extend --blob-id <id> --epochs N`
+  extends storage in place without re-downloading/re-uploading the bytes (out of scope here since
+  the datastore is deliberately HTTP-only and holds no Sui key).
+- **Lifecycle / safe deletion (JS scripts in `js/`).** Besides `renew.js`: `inspect.js` shows a
+  file's keys/blobs/expiry; `register.js` records `file_blocks(root_cid, key)` edges (idempotent,
+  via `ipfs refs -r`); `forget.js` deletes a file's index rows **without corrupting shared files**.
+  Because IPFS de-dups, two files can share a block (one key/row), so forget deletes only blocks
+  unique to the forgotten file, in one of two modes: *keep-set* (subtract the DAGs of `--keep` /
+  `--keep-pinned` files) or *reference-count* (`--use-refcounts`: delete a block only when no other
+  registered file references it, via an atomic CTE that tests `root_cid <> ALL($targets)` so the
+  orphan check is correct under Postgres' data-modifying-CTE snapshot semantics). The edge table is
+  thus an index-level pinset; it must be backfilled (`register.js --from-pinned`) for refcount mode
+  to be safe.
 - `deletable` defaults to `false`. `Delete` is logical (removes index row only); no on-chain
   Walrus deletion (would need a Sui key).
 - `postgresURL` kept OUT of `DiskSpec` (it carries credentials).
@@ -76,15 +124,24 @@ We worked through several options before landing here:
 ```
 go-ds-s3-walrus/
   walrus.go      # WalrusDatastore: ds.Datastore + ds.Batching; packing in Batch.Commit (package walrusds, at root)
-  client.go      # context-aware Walrus HTTP client (store/read, range read, retries, failover)
-  cache.go       # byte-bounded LRU of whole blobs to serve range reads of packed blocks
-  index.go       # Index interface + postgresIndex (auto-migrate, upsert, put-many, get, delete[-many], list, per-blob renewal)
-  renewal.go     # background epoch-renewal worker (per blob)
+  client.go      # context-aware Walrus HTTP client (blob store/read, range read, quilt store + patch read, retries, failover)
+  cache.go       # byte-bounded LRU of whole blobs / quilt patches to serve packed reads
+  index.go       # Index interface + postgresIndex (auto-migrate, upsert, put-many, get, delete[-many], list, per-blob renewal; rows carry blob_id + patch_id)
+  renewal.go     # opt-in background epoch-renewal worker + shared renewBlob core (per blob)
+  client_test.go # quilt multipart streaming tests (length invariant + httptest round-trip)
   plugin/
     walrusds.go        # WalrusPlugin + config parser + Plugins var (package plugin)
     walrusds_test.go   # config-parser + DiskSpec tests (passing)
     main/main.go       # buildmode=plugin entrypoint
   Makefile, set-target.sh, go.mod, README.md, CONTEXT.md, LICENSE, version.json
+
+js/                # operator scripts, repo root (sibling of the Go module above)
+  common.js                # shared helpers (CID→key, normalizeCid, pg pool, IPFS API, edges table)
+  renew.js                 # selective renewal (CIDs/keys → distinct blobs → re-upload → index)
+  inspect.js               # show a file's keys/blobs/patch-ids/expiry
+  register.js              # record file_blocks(root_cid,key) edges (+ --from-pinned backfill)
+  forget.js                # safe deletion: keep-set (default) or --use-refcounts
+  package.json             # bins: walrus-renew/inspect/register/forget (pg + multiformats)
 ```
 
 Module path: `github.com/lighthouse-web3/go-ds-s3-walrus`.
@@ -92,18 +149,23 @@ Datastore type name registered with Kubo: `walrusds`.
 
 ## Status
 
-- Implemented and compiling. `go build ./...`, `go vet ./...`, and the plugin config tests
-  pass against the baseline kubo (v0.30.0) and the build also links cleanly when preloaded
-  into newer Kubo (verified against the v0.41.x line via the retarget flow above).
+- Implemented and compiling, **now including Walrus Quilt batch packing** (default) with the
+  legacy concat packer behind `disableQuilt`. `go build ./...`, `go vet ./...`, and the plugin
+  config tests pass against the baseline kubo (v0.30.0) and the build also links cleanly when
+  preloaded into newer Kubo (verified against the v0.41.x line via the retarget flow above).
 - **Not yet tested live** against a real Walrus endpoint + Postgres (no credentials available
   during development).
 
 ## Important caveats / things to verify next
 
-1. **Walrus HTTP API shapes** — `client.go` codes the publisher store response as
-   `newlyCreated.blobObject` / `alreadyCertified` and read as `GET /v1/blobs/{blobId}`.
-   Verify against the actual publisher/aggregator you target; public gateway response shapes
-   can vary.
+1. **Walrus HTTP API shapes** — `client.go` codes the publisher blob-store response as
+   `newlyCreated.blobObject` / `alreadyCertified`, blob read as `GET /v1/blobs/{blobId}`, the
+   quilt store as `PUT /v1/quilts` (multipart) returning `{blobStoreResult, storedQuiltBlobs[]
+   {identifier, quiltPatchId}}`, and quilt member read as
+   `GET /v1/blobs/by-quilt-patch-id/{id}`. Verify against the actual publisher/aggregator you
+   target; public gateway response shapes can vary, and public services cap requests at ~10 MiB
+   so large quilts/packs require a self-hosted publisher+aggregator (which also must support the
+   quilt endpoints — quilt needs a reasonably recent Walrus version).
 2. **Live integration test** — add an env-guarded test exercising Put/Get/Has/GetSize/Delete/
    Query against a real Postgres + Walrus testnet.
 3. **Epoch math for renewal** — `epochDurationSeconds` is operator-supplied wall-clock; the
