@@ -15,12 +15,19 @@ import (
 // It is everything needed to (a) locate the block's bytes within a Walrus blob,
 // (b) answer Has/GetSize without touching Walrus, and (c) drive epoch renewal.
 //
-// With block-packing, several keys can share a single Walrus blob: each row
-// records the BlobID plus the byte range [Offset, Offset+Size) of the block
-// inside that blob. Unpacked blocks (and all legacy rows) simply have
-// Offset == 0 and Size == the whole blob length.
+// Several keys can share a single Walrus blob. There are two packing schemes,
+// distinguished by PatchID:
+//
+//   - Quilt rows (PatchID != ""): the block is a member ("patch") of a Walrus
+//     quilt. BlobID is the quilt's own blob ID (used for renewal grouping) and
+//     PatchID is the QuiltPatchID used to read the member back. Offset is
+//     unused.
+//   - Concat/plain rows (PatchID == ""): the block lives at the byte range
+//     [Offset, Offset+Size) inside the blob BlobID. Unpacked blocks and all
+//     legacy rows are this shape with Offset == 0 and Size == the block length.
 type Record struct {
 	BlobID    string
+	PatchID   string
 	Offset    int64
 	Size      int64
 	Deletable bool
@@ -74,17 +81,33 @@ type postgresIndex struct {
 // stay well under Postgres' 65535 bound parameter limit (8 params per row).
 const putManyChunk = 500
 
+// putManyParams is the number of bound parameters per row in PutMany's
+// multi-row INSERT (created_at/updated_at use now() and bind nothing).
+const putManyParams = 8
+
 // newPostgresIndex opens the Postgres connection, verifies connectivity and
-// ensures the backing table and indexes exist.
-func newPostgresIndex(ctx context.Context, dsn, table string) (*postgresIndex, error) {
+// ensures the backing table and indexes exist. maxOpenConns bounds the
+// connection pool; a value <= 0 applies defaultMaxOpenConns.
+func newPostgresIndex(ctx context.Context, dsn, table string, maxOpenConns int) (*postgresIndex, error) {
 	if table == "" {
 		table = "walrus_index"
+	}
+	if maxOpenConns <= 0 {
+		maxOpenConns = defaultMaxOpenConns
 	}
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("walrusds: opening postgres: %w", err)
 	}
-	db.SetMaxOpenConns(0) // unlimited; pooling handled by driver defaults
+	// Bound the pool so a Commit fan-out (or many concurrent nodes) cannot
+	// exhaust Postgres' max_connections. Idle conns are capped lower so we do
+	// not hold the whole pool open between bursts.
+	db.SetMaxOpenConns(maxOpenConns)
+	idle := maxOpenConns
+	if idle > 16 {
+		idle = 16
+	}
+	db.SetMaxIdleConns(idle)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 
 	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -107,6 +130,7 @@ func (p *postgresIndex) migrate(ctx context.Context) error {
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			key         TEXT PRIMARY KEY,
 			blob_id     TEXT NOT NULL,
+			patch_id    TEXT NOT NULL DEFAULT '',
 			blob_offset BIGINT NOT NULL DEFAULT 0,
 			size        BIGINT NOT NULL,
 			deletable   BOOLEAN NOT NULL DEFAULT FALSE,
@@ -117,6 +141,8 @@ func (p *postgresIndex) migrate(ctx context.Context) error {
 		)`, p.table),
 		// Backward compatibility: repos created before packing lack blob_offset.
 		fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS blob_offset BIGINT NOT NULL DEFAULT 0`, p.table),
+		// Backward compatibility: repos created before quilt support lack patch_id.
+		fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS patch_id TEXT NOT NULL DEFAULT ''`, p.table),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_key_prefix_idx ON %s (key text_pattern_ops)`, p.table, p.table),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_expires_at_idx ON %s (expires_at)`, p.table, p.table),
 		// Renewal groups by blob_id; packed blobs are touched once per blob.
@@ -131,17 +157,18 @@ func (p *postgresIndex) migrate(ctx context.Context) error {
 }
 
 func (p *postgresIndex) Put(ctx context.Context, key string, rec Record) error {
-	q := fmt.Sprintf(`INSERT INTO %s (key, blob_id, blob_offset, size, deletable, end_epoch, expires_at, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now())
+	q := fmt.Sprintf(`INSERT INTO %s (key, blob_id, patch_id, blob_offset, size, deletable, end_epoch, expires_at, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())
 		ON CONFLICT (key) DO UPDATE SET
 			blob_id     = EXCLUDED.blob_id,
+			patch_id    = EXCLUDED.patch_id,
 			blob_offset = EXCLUDED.blob_offset,
 			size        = EXCLUDED.size,
 			deletable   = EXCLUDED.deletable,
 			end_epoch   = EXCLUDED.end_epoch,
 			expires_at  = EXCLUDED.expires_at,
 			updated_at  = now()`, p.table)
-	_, err := p.db.ExecContext(ctx, q, key, rec.BlobID, rec.Offset, rec.Size, rec.Deletable, int64(rec.EndEpoch), rec.ExpiresAt)
+	_, err := p.db.ExecContext(ctx, q, key, rec.BlobID, rec.PatchID, rec.Offset, rec.Size, rec.Deletable, int64(rec.EndEpoch), rec.ExpiresAt)
 	if err != nil {
 		return fmt.Errorf("walrusds: index put %q: %w", key, err)
 	}
@@ -171,21 +198,22 @@ func (p *postgresIndex) PutMany(ctx context.Context, recs []KeyRecord) error {
 
 		var (
 			sb   strings.Builder
-			args = make([]interface{}, 0, len(chunk)*7)
+			args = make([]interface{}, 0, len(chunk)*putManyParams)
 		)
-		sb.WriteString(fmt.Sprintf(`INSERT INTO %s (key, blob_id, blob_offset, size, deletable, end_epoch, expires_at, created_at, updated_at) VALUES `, p.table))
+		sb.WriteString(fmt.Sprintf(`INSERT INTO %s (key, blob_id, patch_id, blob_offset, size, deletable, end_epoch, expires_at, created_at, updated_at) VALUES `, p.table))
 		for i, kr := range chunk {
 			if i > 0 {
 				sb.WriteByte(',')
 			}
-			b := i * 7
-			sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d,now(),now())",
-				b+1, b+2, b+3, b+4, b+5, b+6, b+7))
-			args = append(args, kr.Key, kr.Rec.BlobID, kr.Rec.Offset, kr.Rec.Size,
+			b := i * putManyParams
+			sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,now(),now())",
+				b+1, b+2, b+3, b+4, b+5, b+6, b+7, b+8))
+			args = append(args, kr.Key, kr.Rec.BlobID, kr.Rec.PatchID, kr.Rec.Offset, kr.Rec.Size,
 				kr.Rec.Deletable, int64(kr.Rec.EndEpoch), kr.Rec.ExpiresAt)
 		}
 		sb.WriteString(` ON CONFLICT (key) DO UPDATE SET
 			blob_id     = EXCLUDED.blob_id,
+			patch_id    = EXCLUDED.patch_id,
 			blob_offset = EXCLUDED.blob_offset,
 			size        = EXCLUDED.size,
 			deletable   = EXCLUDED.deletable,
@@ -205,12 +233,12 @@ func (p *postgresIndex) PutMany(ctx context.Context, recs []KeyRecord) error {
 }
 
 func (p *postgresIndex) Get(ctx context.Context, key string) (Record, error) {
-	q := fmt.Sprintf(`SELECT blob_id, blob_offset, size, deletable, end_epoch, expires_at FROM %s WHERE key = $1`, p.table)
+	q := fmt.Sprintf(`SELECT blob_id, patch_id, blob_offset, size, deletable, end_epoch, expires_at FROM %s WHERE key = $1`, p.table)
 	var (
 		rec      Record
 		endEpoch int64
 	)
-	err := p.db.QueryRowContext(ctx, q, key).Scan(&rec.BlobID, &rec.Offset, &rec.Size, &rec.Deletable, &endEpoch, &rec.ExpiresAt)
+	err := p.db.QueryRowContext(ctx, q, key).Scan(&rec.BlobID, &rec.PatchID, &rec.Offset, &rec.Size, &rec.Deletable, &endEpoch, &rec.ExpiresAt)
 	switch {
 	case err == sql.ErrNoRows:
 		return Record{}, ds.ErrNotFound

@@ -61,27 +61,55 @@ func (w *WalrusDatastore) renewExpiring(ctx context.Context, lead time.Duration)
 	return nil
 }
 
-// renewOneBlob re-uploads a single (possibly packed) blob's bytes and points
-// every block that lived in it at the refreshed blob. We read the whole blob
-// from the aggregator and store it again; this needs only the HTTP API (no Sui
-// key) at the cost of one round-trip per blob near expiry, regardless of how
-// many IPFS blocks the blob holds.
+// renewOneBlob refreshes the paid storage of a single Walrus blob and points
+// every index row that referenced it at the renewed blob. The blob may be a
+// plain block, a concatenated pack, or a quilt — in every case it is one
+// content-addressed Walrus blob identified by it.BlobID (for a quilt, its quilt
+// ID). We read the whole blob from the aggregator and store the identical bytes
+// again for a fresh epoch window.
+//
+// Because Walrus blob IDs are content-derived, re-uploading the same bytes
+// yields the same blob ID; for a quilt the member QuiltPatchIDs (quilt ID +
+// position) are therefore unchanged too, so the existing patch_id rows stay
+// valid and only end_epoch/expires_at are updated. This needs only the HTTP API
+// (no Sui key) at the cost of one round-trip per blob near expiry, regardless
+// of how many IPFS blocks the blob holds.
+//
+// Operators who run the Walrus CLI with a funded Sui key can instead extend a
+// blob in place (`walrus extend --blob-id <id> --epochs N`), which avoids
+// re-downloading and re-uploading the bytes; that path is out of scope here
+// because this datastore is deliberately HTTP-only and holds no Sui key.
 func (w *WalrusDatastore) renewOneBlob(ctx context.Context, it RenewItem) error {
-	data, err := w.client.Read(ctx, it.BlobID)
+	return renewBlob(ctx, w.client, w.index, it.BlobID, w.conf.Epochs, w.conf.Deletable, w.conf.EpochDuration)
+}
+
+// renewBlob refreshes one Walrus blob's paid storage and repoints every index
+// row that referenced it. It is the shared core used both by the optional
+// background worker and by out-of-band renewal (see Renewer): read the whole
+// blob, store the identical bytes for a fresh epoch window, then update the
+// index. epochDuration, when > 0, is used to compute the new expires_at;
+// otherwise expires_at is left NULL (the operator tracks timing externally).
+//
+// A single blob may back many keys (a quilt or a concat pack), so one call here
+// renews all of them at once. For a quilt, blobID is the quilt ID and the
+// member QuiltPatchIds are unchanged by re-upload, so existing patch_id rows
+// stay valid.
+func renewBlob(ctx context.Context, client *Client, index Index, blobID string, epochs int, deletable bool, epochDuration time.Duration) error {
+	data, err := client.Read(ctx, blobID)
 	if err != nil {
 		return err
 	}
-	res, err := w.client.Store(ctx, data, w.conf.Epochs, w.conf.Deletable)
+	res, err := client.Store(ctx, data, epochs, deletable)
 	if err != nil {
 		return err
 	}
 
 	var expiresAt sql.NullTime
-	if w.conf.EpochDuration > 0 {
+	if epochDuration > 0 {
 		expiresAt = sql.NullTime{
-			Time:  time.Now().Add(time.Duration(w.conf.Epochs) * w.conf.EpochDuration),
+			Time:  time.Now().Add(time.Duration(epochs) * epochDuration),
 			Valid: true,
 		}
 	}
-	return w.index.UpdateBlobAfterRenewal(ctx, it.BlobID, res.BlobID, res.EndEpoch, expiresAt)
+	return index.UpdateBlobAfterRenewal(ctx, blobID, res.BlobID, res.EndEpoch, expiresAt)
 }

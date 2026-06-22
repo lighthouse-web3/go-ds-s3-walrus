@@ -3,11 +3,14 @@ package walrusds
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -25,6 +28,30 @@ var ErrBlobNotFound = errors.New("walrusds: blob not found")
 type StoreResult struct {
 	BlobID   string
 	EndEpoch uint64
+}
+
+// QuiltPart is a single small blob (an IPFS block) to be batched into a quilt.
+// Identifier is the unique name of the part within the quilt; the store
+// response echoes it back paired with the part's QuiltPatchID.
+type QuiltPart struct {
+	Identifier string
+	Data       []byte
+}
+
+// QuiltPatch is one stored member of a quilt: the identifier we supplied and
+// the QuiltPatchID assigned by Walrus, which is how the part is read back.
+type QuiltPatch struct {
+	Identifier   string
+	QuiltPatchID string
+}
+
+// QuiltStoreResult is the parsed result of a store-quilt call: the quilt's own
+// blob ID (used for renewal/extension, since the quilt is itself one Walrus
+// blob), the epoch its paid storage ends, and the per-part patch IDs.
+type QuiltStoreResult struct {
+	QuiltID  string
+	EndEpoch uint64
+	Patches  []QuiltPatch
 }
 
 // Client is a small, context-aware HTTP client for the Walrus publisher
@@ -129,6 +156,133 @@ func (c *Client) Store(ctx context.Context, value []byte, epochs int, deletable 
 		return result, nil
 	}
 	return StoreResult{}, fmt.Errorf("walrusds: store failed on all publishers: %w", lastErr)
+}
+
+// StoreQuilt batches many small blobs into a single Walrus quilt via the
+// publisher's PUT /v1/quilts endpoint (multipart/form-data, one file part per
+// member keyed by its identifier). A quilt shares one Walrus blob's overhead
+// (Sui storage object, gas, erasure-coding metadata) across all its members,
+// which is dramatically cheaper than one blob per small block. The returned
+// QuiltStoreResult carries the quilt's blob ID plus each member's QuiltPatchID
+// for later individual retrieval.
+func (c *Client) StoreQuilt(ctx context.Context, parts []QuiltPart, epochs int, deletable bool) (QuiltStoreResult, error) {
+	if len(c.publishers) == 0 {
+		return QuiltStoreResult{}, errors.New("walrusds: no publisher URLs configured")
+	}
+	if len(parts) == 0 {
+		return QuiltStoreResult{}, errors.New("walrusds: store-quilt called with no parts")
+	}
+
+	// Stream the multipart body straight from each part's bytes via an
+	// io.Pipe instead of assembling the whole body in a buffer first, which
+	// would hold a second full copy of the pack in memory. A fixed boundary
+	// makes the wire format deterministic, so we can precompute Content-Length
+	// (avoiding chunked transfer-encoding) and regenerate the body on each
+	// retry/failover attempt.
+	boundary, err := multipartBoundary()
+	if err != nil {
+		return QuiltStoreResult{}, fmt.Errorf("walrusds: building quilt body: %w", err)
+	}
+	contentType := "multipart/form-data; boundary=" + boundary
+	contentLen := multipartBodyLength(parts, boundary)
+
+	q := url.Values{}
+	if epochs > 0 {
+		q.Set("epochs", strconv.Itoa(epochs))
+	}
+	if deletable {
+		q.Set("deletable", "true")
+	}
+
+	var lastErr error
+	for _, base := range c.publishers {
+		endpoint := base + "/v1/quilts"
+		if enc := q.Encode(); enc != "" {
+			endpoint += "?" + enc
+		}
+
+		res, err := c.doWithRetry(ctx, func() (*http.Response, error) {
+			pr, pw := io.Pipe()
+			go func() {
+				// CloseWithError(nil) closes the pipe cleanly on success.
+				pw.CloseWithError(writeMultipartBody(pw, parts, boundary))
+			}()
+			req, rerr := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, pr)
+			if rerr != nil {
+				pr.CloseWithError(rerr)
+				return nil, rerr
+			}
+			req.Header.Set("Content-Type", contentType)
+			req.ContentLength = contentLen
+			return c.http.Do(req)
+		})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		result, perr := parseQuiltStoreResponse(res)
+		if perr != nil {
+			lastErr = perr
+			continue
+		}
+		return result, nil
+	}
+	return QuiltStoreResult{}, fmt.Errorf("walrusds: store-quilt failed on all publishers: %w", lastErr)
+}
+
+// writeMultipartBody streams the quilt parts as a multipart/form-data body with
+// a fixed boundary, one file field per member keyed by its identifier. It is
+// the streaming counterpart of multipartBodyLength: the two MUST agree
+// byte-for-byte (guarded by a test) so the precomputed Content-Length is exact.
+func writeMultipartBody(w io.Writer, parts []QuiltPart, boundary string) error {
+	mw := multipart.NewWriter(w)
+	if err := mw.SetBoundary(boundary); err != nil {
+		return err
+	}
+	for _, p := range parts {
+		fw, err := mw.CreateFormFile(p.Identifier, p.Identifier)
+		if err != nil {
+			return err
+		}
+		if _, err := fw.Write(p.Data); err != nil {
+			return err
+		}
+	}
+	return mw.Close()
+}
+
+// multipartBodyLength returns the exact byte length writeMultipartBody produces
+// for the same parts and boundary. It mirrors mime/multipart's wire format:
+// CreateFormFile emits Content-Disposition then Content-Type headers, parts are
+// separated by CRLF + "--boundary", and the body terminates with
+// "--boundary--". Quilt identifiers are decimal indices, so no quote-escaping
+// of the header names is needed.
+func multipartBodyLength(parts []QuiltPart, boundary string) int64 {
+	var n int64
+	for i, p := range parts {
+		if i == 0 {
+			n += int64(len("--" + boundary + "\r\n"))
+		} else {
+			n += int64(len("\r\n--" + boundary + "\r\n"))
+		}
+		n += int64(len(`Content-Disposition: form-data; name="` + p.Identifier + `"; filename="` + p.Identifier + `"` + "\r\n"))
+		n += int64(len("Content-Type: application/octet-stream\r\n"))
+		n += int64(len("\r\n"))
+		n += int64(len(p.Data))
+	}
+	n += int64(len("\r\n--" + boundary + "--\r\n"))
+	return n
+}
+
+// multipartBoundary returns a random multipart boundary (60 hex chars), well
+// within mime/multipart's 70-character limit.
+func multipartBoundary() (string, error) {
+	var buf [30]byte
+	if _, err := crand.Read(buf[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf[:]), nil
 }
 
 // Read fetches the bytes of the blob identified by blobID from a Walrus
@@ -244,6 +398,54 @@ func (c *Client) readRangeResponse(res *http.Response, blobID string, offset, le
 	}
 }
 
+// ReadQuiltPatch fetches a single quilt member by its QuiltPatchID via the
+// aggregator's GET /v1/blobs/by-quilt-patch-id/{id} endpoint. Only that
+// member's bytes travel over the wire (the aggregator decodes just the patch's
+// slivers), so packed blocks stay cheap to read. Results are cached in the
+// byte-bounded LRU keyed by patch ID.
+func (c *Client) ReadQuiltPatch(ctx context.Context, patchID string) ([]byte, error) {
+	if len(c.aggregators) == 0 {
+		return nil, errors.New("walrusds: no aggregator URLs configured")
+	}
+
+	if data, ok := c.cache.get(patchID); ok {
+		out := make([]byte, len(data))
+		copy(out, data)
+		return out, nil
+	}
+
+	var lastErr error
+	for _, base := range c.aggregators {
+		endpoint := base + "/v1/blobs/by-quilt-patch-id/" + url.PathEscape(patchID)
+
+		res, err := c.doWithRetry(ctx, func() (*http.Response, error) {
+			req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+			if rerr != nil {
+				return nil, rerr
+			}
+			return c.http.Do(req)
+		})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		data, rerr := readBlobResponse(res)
+		if rerr != nil {
+			if errors.Is(rerr, ErrBlobNotFound) {
+				return nil, ErrBlobNotFound
+			}
+			lastErr = rerr
+			continue
+		}
+		c.cache.add(patchID, data)
+		out := make([]byte, len(data))
+		copy(out, data)
+		return out, nil
+	}
+	return nil, fmt.Errorf("walrusds: quilt patch read failed on all aggregators: %w", lastErr)
+}
+
 // sliceBlob returns a copy of full[offset:offset+length], clamped to the blob
 // length. It copies so callers can't mutate cached blob bytes.
 func sliceBlob(full []byte, offset, length int64) ([]byte, error) {
@@ -347,19 +549,9 @@ type storeResponse struct {
 	} `json:"alreadyCertified"`
 }
 
-func parseStoreResponse(res *http.Response) (StoreResult, error) {
-	defer res.Body.Close()
-
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(res.Body, 512))
-		return StoreResult{}, fmt.Errorf("walrusds: publisher returned %d: %s", res.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	var sr storeResponse
-	if err := json.NewDecoder(res.Body).Decode(&sr); err != nil {
-		return StoreResult{}, fmt.Errorf("walrusds: decoding store response: %w", err)
-	}
-
+// result extracts the blob ID and end epoch from a decoded publisher store
+// response, handling both the "newly created" and "already certified" shapes.
+func (sr storeResponse) result() (StoreResult, error) {
 	switch {
 	case sr.NewlyCreated != nil && sr.NewlyCreated.BlobObject.BlobID != "":
 		return StoreResult{
@@ -374,4 +566,66 @@ func parseStoreResponse(res *http.Response) (StoreResult, error) {
 	default:
 		return StoreResult{}, errors.New("walrusds: store response missing blob ID")
 	}
+}
+
+func parseStoreResponse(res *http.Response) (StoreResult, error) {
+	defer res.Body.Close()
+
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 512))
+		return StoreResult{}, fmt.Errorf("walrusds: publisher returned %d: %s", res.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var sr storeResponse
+	if err := json.NewDecoder(res.Body).Decode(&sr); err != nil {
+		return StoreResult{}, fmt.Errorf("walrusds: decoding store response: %w", err)
+	}
+	return sr.result()
+}
+
+// quiltStoreResponse mirrors the publisher's PUT /v1/quilts JSON: the quilt is
+// itself a Walrus blob (described by the same store-result shape) plus a list
+// pairing each member's identifier with its assigned QuiltPatchID.
+type quiltStoreResponse struct {
+	BlobStoreResult  storeResponse `json:"blobStoreResult"`
+	StoredQuiltBlobs []struct {
+		Identifier   string `json:"identifier"`
+		QuiltPatchID string `json:"quiltPatchId"`
+	} `json:"storedQuiltBlobs"`
+}
+
+func parseQuiltStoreResponse(res *http.Response) (QuiltStoreResult, error) {
+	defer res.Body.Close()
+
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 512))
+		return QuiltStoreResult{}, fmt.Errorf("walrusds: publisher returned %d: %s", res.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var qr quiltStoreResponse
+	if err := json.NewDecoder(res.Body).Decode(&qr); err != nil {
+		return QuiltStoreResult{}, fmt.Errorf("walrusds: decoding quilt store response: %w", err)
+	}
+
+	blob, err := qr.BlobStoreResult.result()
+	if err != nil {
+		return QuiltStoreResult{}, err
+	}
+	if len(qr.StoredQuiltBlobs) == 0 {
+		return QuiltStoreResult{}, errors.New("walrusds: quilt store response missing stored blobs")
+	}
+
+	patches := make([]QuiltPatch, 0, len(qr.StoredQuiltBlobs))
+	for _, sb := range qr.StoredQuiltBlobs {
+		if sb.QuiltPatchID == "" {
+			return QuiltStoreResult{}, fmt.Errorf("walrusds: quilt store response missing patch ID for %q", sb.Identifier)
+		}
+		patches = append(patches, QuiltPatch{Identifier: sb.Identifier, QuiltPatchID: sb.QuiltPatchID})
+	}
+
+	return QuiltStoreResult{
+		QuiltID:  blob.BlobID,
+		EndEpoch: blob.EndEpoch,
+		Patches:  patches,
+	}, nil
 }

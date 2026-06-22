@@ -3,7 +3,9 @@ module github.com/lighthouse-web3/go-ds-s3-walrus
 go 1.22
 
 require (
+	github.com/ipfs/go-cid v0.4.1
 	github.com/ipfs/go-datastore v0.6.0
+	github.com/ipfs/go-ipfs-ds-help v1.1.1
 	github.com/ipfs/kubo v0.30.0
 	github.com/lib/pq v1.10.9
 )
@@ -51,13 +53,11 @@ require (
 	github.com/ipfs/go-bitfield v1.1.0 // indirect
 	github.com/ipfs/go-block-format v0.2.0 // indirect
 	github.com/ipfs/go-blockservice v0.5.2 // indirect
-	github.com/ipfs/go-cid v0.4.1 // indirect
 	github.com/ipfs/go-cidutil v0.1.0 // indirect
 	github.com/ipfs/go-ds-measure v0.2.0 // indirect
 	github.com/ipfs/go-fs-lock v0.0.7 // indirect
 	github.com/ipfs/go-ipfs-blockstore v1.3.1 // indirect
 	github.com/ipfs/go-ipfs-delay v0.0.1 // indirect
-	github.com/ipfs/go-ipfs-ds-help v1.1.1 // indirect
 	github.com/ipfs/go-ipfs-exchange-interface v0.2.1 // indirect
 	github.com/ipfs/go-ipfs-pq v0.0.3 // indirect
 	github.com/ipfs/go-ipfs-redirects-file v0.1.1 // indirect
