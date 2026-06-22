@@ -20,6 +20,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,7 +30,18 @@ import (
 )
 
 const (
-	defaultWorkers        = 100
+	// defaultWorkers is the Batch.Commit() upload concurrency. Each in-flight
+	// pack holds its bytes in memory while uploading, so peak memory scales
+	// with workers × PackTargetSize; 16 keeps that bounded (≈1 GiB at the 64
+	// MiB default) while still saturating a self-hosted publisher. Raise it
+	// only alongside more RAM (and a matching maxOpenConns).
+	defaultWorkers = 16
+	// defaultMaxOpenConns bounds the Postgres connection pool. Commit fans out
+	// to `workers` goroutines that each run a PutMany, plus reads/renewal, so
+	// the pool must comfortably exceed Workers; 32 covers the default worker
+	// count with headroom. An unbounded pool (the old behaviour) can exhaust
+	// Postgres' max_connections under load.
+	defaultMaxOpenConns   = 32
 	defaultEpochs         = 1
 	defaultRequestTimeout = 60 * time.Second
 	defaultMaxRetries     = 3
@@ -47,6 +59,12 @@ const (
 	// default-target pack (64 MiB) stays cacheable (per-entry cap is a quarter
 	// of the budget).
 	defaultBlobCacheBytes = 256 << 20 // 256 MiB
+	// quiltMaxPatches is the maximum number of member blobs in a single
+	// QuiltV1. It is fixed by the protocol (derived from the 1000-shard
+	// committee: 667 secondary columns minus one reserved for the index).
+	// A pack destined to become a quilt may therefore hold at most this many
+	// blocks regardless of PackTargetSize.
+	quiltMaxPatches = 666
 )
 
 var (
@@ -74,14 +92,27 @@ type Config struct {
 	// Deletable registers blobs as deletable on Walrus. Defaults to false.
 	Deletable bool
 	// Workers is the Batch.Commit() concurrency. Defaults to defaultWorkers.
+	// Peak upload memory is roughly Workers × PackTargetSize, so raise both
+	// Workers and host RAM together.
 	Workers int
+	// MaxOpenConns bounds the Postgres connection pool. Defaults to
+	// defaultMaxOpenConns. Keep it >= Workers so committing packs does not
+	// starve on connections; a value <= 0 applies the default.
+	MaxOpenConns int
 
 	// PackTargetSize is the target size (in bytes) of a packed Walrus blob.
-	// During Batch.Commit, blocks are concatenated into packfiles up to this
-	// size and uploaded as a single blob, amortizing the per-blob Walrus cost
-	// (Sui gas + WAL minimums) across many IPFS blocks. A block larger than
-	// this gets its own blob. Defaults to defaultPackTargetSize.
+	// During Batch.Commit, blocks are grouped into packs up to this size and
+	// uploaded as a single Walrus quilt (or, with DisableQuilt, a concatenated
+	// blob), amortizing the per-blob Walrus cost (Sui gas + WAL minimums) across
+	// many IPFS blocks. A block larger than this gets its own blob. Defaults to
+	// defaultPackTargetSize.
 	PackTargetSize int64
+	// DisableQuilt reverts batch packing to the legacy scheme: blocks are
+	// concatenated into one opaque blob and read back by byte range. By default
+	// (false) batches are stored as Walrus quilts, which share blob overhead
+	// natively and are read back per-member by QuiltPatchID. Existing rows
+	// written under either scheme keep working regardless of this setting.
+	DisableQuilt bool
 	// BlobCacheBytes is the byte budget for the in-memory LRU of whole blobs
 	// used to serve range reads of packed blocks. Defaults to
 	// defaultBlobCacheBytes; a negative value disables the cache.
@@ -135,6 +166,9 @@ func NewWalrusDatastore(conf Config) (*WalrusDatastore, error) {
 	if conf.Workers <= 0 {
 		conf.Workers = defaultWorkers
 	}
+	if conf.MaxOpenConns <= 0 {
+		conf.MaxOpenConns = defaultMaxOpenConns
+	}
 	if conf.RequestTimeout <= 0 {
 		conf.RequestTimeout = defaultRequestTimeout
 	}
@@ -155,7 +189,7 @@ func NewWalrusDatastore(conf Config) (*WalrusDatastore, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	index, err := newPostgresIndex(ctx, conf.PostgresURL, conf.Table)
+	index, err := newPostgresIndex(ctx, conf.PostgresURL, conf.Table, conf.MaxOpenConns)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -230,7 +264,15 @@ func (w *WalrusDatastore) Get(ctx context.Context, k ds.Key) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	data, err := w.client.ReadRange(ctx, rec.BlobID, rec.Offset, rec.Size)
+
+	// A non-empty PatchID means the block is a quilt member; read it by patch.
+	// Otherwise it is a plain/concatenated blob addressed by byte range.
+	var data []byte
+	if rec.PatchID != "" {
+		data, err = w.client.ReadQuiltPatch(ctx, rec.PatchID)
+	} else {
+		data, err = w.client.ReadRange(ctx, rec.BlobID, rec.Offset, rec.Size)
+	}
 	if err != nil {
 		if err == ErrBlobNotFound {
 			return nil, ds.ErrNotFound
@@ -383,7 +425,11 @@ func (b *walrusBatch) Commit(ctx context.Context) error {
 		}
 	}
 
-	packs := buildPacks(puts, b.w.conf.PackTargetSize)
+	maxPerPack := 0
+	if !b.w.conf.DisableQuilt {
+		maxPerPack = quiltMaxPatches
+	}
+	packs := buildPacks(puts, b.w.conf.PackTargetSize, maxPerPack)
 
 	jobs := make([]func() error, 0, len(packs)+1)
 	for _, pack := range packs {
@@ -436,9 +482,10 @@ func (b *walrusBatch) Commit(ctx context.Context) error {
 	return nil
 }
 
-// buildPacks greedily groups blocks into packs no larger than target bytes. A
-// single block bigger than target gets its own pack (it cannot be split).
-func buildPacks(puts []blockEntry, target int64) [][]blockEntry {
+// buildPacks greedily groups blocks into packs no larger than target bytes and,
+// when maxCount > 0, no more than maxCount blocks each (the quilt member limit).
+// A single block bigger than target gets its own pack (it cannot be split).
+func buildPacks(puts []blockEntry, target int64, maxCount int) [][]blockEntry {
 	if target <= 0 {
 		target = defaultPackTargetSize
 	}
@@ -449,7 +496,9 @@ func buildPacks(puts []blockEntry, target int64) [][]blockEntry {
 	)
 	for _, e := range puts {
 		sz := int64(len(e.val))
-		if len(cur) > 0 && curSize+sz > target {
+		overSize := curSize+sz > target
+		overCount := maxCount > 0 && len(cur) >= maxCount
+		if len(cur) > 0 && (overSize || overCount) {
 			packs = append(packs, cur)
 			cur = nil
 			curSize = 0
@@ -463,13 +512,91 @@ func buildPacks(puts []blockEntry, target int64) [][]blockEntry {
 	return packs
 }
 
-// storePack concatenates a pack's blocks into one blob, uploads it to Walrus,
-// then records each block's byte range in the index in a single transaction.
+// storePack persists one pack of blocks, keeping the Walrus-first ordering
+// invariant (blob stored before index rows). A single-block pack is stored as
+// a plain blob; a multi-block pack is stored as a Walrus quilt unless quilting
+// is disabled, in which case it falls back to the legacy concatenated blob.
 func (w *WalrusDatastore) storePack(ctx context.Context, pack []blockEntry) error {
-	if len(pack) == 0 {
+	switch {
+	case len(pack) == 0:
 		return nil
+	case len(pack) == 1:
+		return w.storeSingleBlock(ctx, pack[0])
+	case w.conf.DisableQuilt:
+		return w.storeConcatPack(ctx, pack)
+	default:
+		return w.storeQuiltPack(ctx, pack)
+	}
+}
+
+// storeSingleBlock stores one block as its own Walrus blob (a quilt of one is
+// not worthwhile). The row has an empty PatchID and Offset 0.
+func (w *WalrusDatastore) storeSingleBlock(ctx context.Context, e blockEntry) error {
+	res, err := w.client.Store(ctx, e.val, w.conf.Epochs, w.conf.Deletable)
+	if err != nil {
+		return fmt.Errorf("walrusds: storing block %s: %w", e.key, err)
+	}
+	rec := Record{
+		BlobID:    res.BlobID,
+		Offset:    0,
+		Size:      int64(len(e.val)),
+		Deletable: w.conf.Deletable,
+		EndEpoch:  res.EndEpoch,
+		ExpiresAt: w.expiry(),
+	}
+	return w.index.Put(ctx, e.key, rec)
+}
+
+// storeQuiltPack stores a pack of blocks as a single Walrus quilt and records
+// each member's QuiltPatchID in the index in one transaction. Member
+// identifiers are the block's position in the pack, which the store response
+// echoes back so we can map each returned patch ID to its key.
+func (w *WalrusDatastore) storeQuiltPack(ctx context.Context, pack []blockEntry) error {
+	parts := make([]QuiltPart, len(pack))
+	keyByID := make(map[string]string, len(pack))
+	sizeByID := make(map[string]int64, len(pack))
+	for i, e := range pack {
+		id := strconv.Itoa(i)
+		parts[i] = QuiltPart{Identifier: id, Data: e.val}
+		keyByID[id] = e.key
+		sizeByID[id] = int64(len(e.val))
 	}
 
+	res, err := w.client.StoreQuilt(ctx, parts, w.conf.Epochs, w.conf.Deletable)
+	if err != nil {
+		return fmt.Errorf("walrusds: storing quilt of %d blocks: %w", len(pack), err)
+	}
+	if len(res.Patches) != len(pack) {
+		return fmt.Errorf("walrusds: quilt stored %d patches, expected %d", len(res.Patches), len(pack))
+	}
+
+	expiry := w.expiry()
+	recs := make([]KeyRecord, 0, len(res.Patches))
+	for _, p := range res.Patches {
+		key, ok := keyByID[p.Identifier]
+		if !ok {
+			return fmt.Errorf("walrusds: quilt returned unknown identifier %q", p.Identifier)
+		}
+		recs = append(recs, KeyRecord{
+			Key: key,
+			Rec: Record{
+				BlobID:    res.QuiltID,
+				PatchID:   p.QuiltPatchID,
+				Offset:    0,
+				Size:      sizeByID[p.Identifier],
+				Deletable: w.conf.Deletable,
+				EndEpoch:  res.EndEpoch,
+				ExpiresAt: expiry,
+			},
+		})
+	}
+	return w.index.PutMany(ctx, recs)
+}
+
+// storeConcatPack is the legacy packing scheme: concatenate the pack's blocks
+// into one blob, upload it, and record each block's byte range. Used only when
+// DisableQuilt is set.
+func (w *WalrusDatastore) storeConcatPack(ctx context.Context, pack []blockEntry) error {
 	var total int64
 	for _, e := range pack {
 		total += int64(len(e.val))
