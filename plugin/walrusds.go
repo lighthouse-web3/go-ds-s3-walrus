@@ -25,7 +25,7 @@ func (WalrusPlugin) Name() string {
 }
 
 func (WalrusPlugin) Version() string {
-	return "0.0.1"
+	return "0.2.0"
 }
 
 func (WalrusPlugin) Init(*plugin.Environment) error {
@@ -48,11 +48,13 @@ func (WalrusPlugin) DatastoreTypeName() string {
 //   - "table"                 (string; index table, default "walrus_index")
 //   - "epochs"                (number; storage epochs to buy, default 1)
 //   - "deletable"             (bool;   register blobs as deletable)
-//   - "workers"               (number; batch concurrency)
+//   - "workers"               (number; batch concurrency, default 16)
+//   - "maxOpenConns"          (number; Postgres pool size, default 32)
 //   - "requestTimeoutSeconds" (number; per-attempt Walrus HTTP timeout)
 //   - "maxRetries"            (number; retries per Walrus request)
-//   - "packTargetSizeBytes"   (number; target packed-blob size, default 8 MiB)
-//   - "blobCacheBytes"        (number; LRU budget for range reads, default 128 MiB)
+//   - "packTargetSizeBytes"   (number; target packed-blob size, default 64 MiB)
+//   - "disableQuilt"          (bool;   pack batches as concatenated blobs instead of quilts)
+//   - "blobCacheBytes"        (number; LRU budget for range reads, default 256 MiB)
 //   - "epochDurationSeconds"  (number; wall-clock length of one epoch; enables renewal)
 //   - "renewIntervalSeconds"  (number; how often to scan for expiring blobs)
 //   - "renewLeadSeconds"      (number; how far ahead of expiry to renew)
@@ -93,15 +95,26 @@ func (WalrusPlugin) DatastoreConfigParser() fsrepo.ConfigFromMap {
 			cfg.Deletable = b
 		}
 
+		if v, ok := m["disableQuilt"]; ok {
+			b, ok := v.(bool)
+			if !ok {
+				return nil, fmt.Errorf("walrusds: disableQuilt not a boolean")
+			}
+			cfg.DisableQuilt = b
+		}
+
 		if cfg.Epochs, err = optionalPositiveInt(m, "epochs"); err != nil {
 			return nil, err
 		}
-		if cfg.Workers, err = optionalPositiveInt(m, "workers"); err != nil {
-			return nil, err
-		}
-		if cfg.MaxRetries, err = optionalPositiveInt(m, "maxRetries"); err != nil {
-			return nil, err
-		}
+	if cfg.Workers, err = optionalPositiveInt(m, "workers"); err != nil {
+		return nil, err
+	}
+	if cfg.MaxOpenConns, err = optionalPositiveInt(m, "maxOpenConns"); err != nil {
+		return nil, err
+	}
+	if cfg.MaxRetries, err = optionalPositiveInt(m, "maxRetries"); err != nil {
+		return nil, err
+	}
 
 		packBytes, err := optionalPositiveInt(m, "packTargetSizeBytes")
 		if err != nil {
