@@ -26,7 +26,13 @@ import (
 //     [Offset, Offset+Size) inside the blob BlobID. Unpacked blocks and all
 //     legacy rows are this shape with Offset == 0 and Size == the block length.
 type Record struct {
-	BlobID    string
+	BlobID string
+	// ObjectID is the Sui object ID of the Walrus Blob object backing this row
+	// (for a quilt, the quilt blob's object). It is what external renewal needs
+	// to extend the blob in place via `walrus extend` instead of re-uploading.
+	// It may be empty for legacy rows written before object IDs were tracked,
+	// or when the publisher returned an already-certified blob (no owned object).
+	ObjectID  string
 	PatchID   string
 	Offset    int64
 	Size      int64
@@ -65,7 +71,7 @@ type Index interface {
 	DeleteMany(ctx context.Context, keys []string) error
 	List(ctx context.Context, prefix string, limit, offset int) ([]ListItem, error)
 	DueForRenewal(ctx context.Context, before time.Time, limit int) ([]RenewItem, error)
-	UpdateBlobAfterRenewal(ctx context.Context, oldBlobID, newBlobID string, endEpoch uint64, expiresAt sql.NullTime) error
+	UpdateBlobAfterRenewal(ctx context.Context, oldBlobID, newBlobID, newObjectID string, endEpoch uint64, expiresAt sql.NullTime) error
 	Close() error
 }
 
@@ -83,7 +89,7 @@ const putManyChunk = 500
 
 // putManyParams is the number of bound parameters per row in PutMany's
 // multi-row INSERT (created_at/updated_at use now() and bind nothing).
-const putManyParams = 8
+const putManyParams = 9
 
 // newPostgresIndex opens the Postgres connection, verifies connectivity and
 // ensures the backing table and indexes exist. maxOpenConns bounds the
@@ -130,6 +136,7 @@ func (p *postgresIndex) migrate(ctx context.Context) error {
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			key         TEXT PRIMARY KEY,
 			blob_id     TEXT NOT NULL,
+			object_id   TEXT NOT NULL DEFAULT '',
 			patch_id    TEXT NOT NULL DEFAULT '',
 			blob_offset BIGINT NOT NULL DEFAULT 0,
 			size        BIGINT NOT NULL,
@@ -143,6 +150,8 @@ func (p *postgresIndex) migrate(ctx context.Context) error {
 		fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS blob_offset BIGINT NOT NULL DEFAULT 0`, p.table),
 		// Backward compatibility: repos created before quilt support lack patch_id.
 		fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS patch_id TEXT NOT NULL DEFAULT ''`, p.table),
+		// Backward compatibility: repos created before in-place extend lack object_id.
+		fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS object_id TEXT NOT NULL DEFAULT ''`, p.table),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_key_prefix_idx ON %s (key text_pattern_ops)`, p.table, p.table),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_expires_at_idx ON %s (expires_at)`, p.table, p.table),
 		// Renewal groups by blob_id; packed blobs are touched once per blob.
@@ -157,10 +166,11 @@ func (p *postgresIndex) migrate(ctx context.Context) error {
 }
 
 func (p *postgresIndex) Put(ctx context.Context, key string, rec Record) error {
-	q := fmt.Sprintf(`INSERT INTO %s (key, blob_id, patch_id, blob_offset, size, deletable, end_epoch, expires_at, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())
+	q := fmt.Sprintf(`INSERT INTO %s (key, blob_id, object_id, patch_id, blob_offset, size, deletable, end_epoch, expires_at, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now())
 		ON CONFLICT (key) DO UPDATE SET
 			blob_id     = EXCLUDED.blob_id,
+			object_id   = EXCLUDED.object_id,
 			patch_id    = EXCLUDED.patch_id,
 			blob_offset = EXCLUDED.blob_offset,
 			size        = EXCLUDED.size,
@@ -168,7 +178,7 @@ func (p *postgresIndex) Put(ctx context.Context, key string, rec Record) error {
 			end_epoch   = EXCLUDED.end_epoch,
 			expires_at  = EXCLUDED.expires_at,
 			updated_at  = now()`, p.table)
-	_, err := p.db.ExecContext(ctx, q, key, rec.BlobID, rec.PatchID, rec.Offset, rec.Size, rec.Deletable, int64(rec.EndEpoch), rec.ExpiresAt)
+	_, err := p.db.ExecContext(ctx, q, key, rec.BlobID, rec.ObjectID, rec.PatchID, rec.Offset, rec.Size, rec.Deletable, int64(rec.EndEpoch), rec.ExpiresAt)
 	if err != nil {
 		return fmt.Errorf("walrusds: index put %q: %w", key, err)
 	}
@@ -200,19 +210,20 @@ func (p *postgresIndex) PutMany(ctx context.Context, recs []KeyRecord) error {
 			sb   strings.Builder
 			args = make([]interface{}, 0, len(chunk)*putManyParams)
 		)
-		sb.WriteString(fmt.Sprintf(`INSERT INTO %s (key, blob_id, patch_id, blob_offset, size, deletable, end_epoch, expires_at, created_at, updated_at) VALUES `, p.table))
+		sb.WriteString(fmt.Sprintf(`INSERT INTO %s (key, blob_id, object_id, patch_id, blob_offset, size, deletable, end_epoch, expires_at, created_at, updated_at) VALUES `, p.table))
 		for i, kr := range chunk {
 			if i > 0 {
 				sb.WriteByte(',')
 			}
 			b := i * putManyParams
-			sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,now(),now())",
-				b+1, b+2, b+3, b+4, b+5, b+6, b+7, b+8))
-			args = append(args, kr.Key, kr.Rec.BlobID, kr.Rec.PatchID, kr.Rec.Offset, kr.Rec.Size,
+			sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,now(),now())",
+				b+1, b+2, b+3, b+4, b+5, b+6, b+7, b+8, b+9))
+			args = append(args, kr.Key, kr.Rec.BlobID, kr.Rec.ObjectID, kr.Rec.PatchID, kr.Rec.Offset, kr.Rec.Size,
 				kr.Rec.Deletable, int64(kr.Rec.EndEpoch), kr.Rec.ExpiresAt)
 		}
 		sb.WriteString(` ON CONFLICT (key) DO UPDATE SET
 			blob_id     = EXCLUDED.blob_id,
+			object_id   = EXCLUDED.object_id,
 			patch_id    = EXCLUDED.patch_id,
 			blob_offset = EXCLUDED.blob_offset,
 			size        = EXCLUDED.size,
@@ -233,12 +244,12 @@ func (p *postgresIndex) PutMany(ctx context.Context, recs []KeyRecord) error {
 }
 
 func (p *postgresIndex) Get(ctx context.Context, key string) (Record, error) {
-	q := fmt.Sprintf(`SELECT blob_id, patch_id, blob_offset, size, deletable, end_epoch, expires_at FROM %s WHERE key = $1`, p.table)
+	q := fmt.Sprintf(`SELECT blob_id, object_id, patch_id, blob_offset, size, deletable, end_epoch, expires_at FROM %s WHERE key = $1`, p.table)
 	var (
 		rec      Record
 		endEpoch int64
 	)
-	err := p.db.QueryRowContext(ctx, q, key).Scan(&rec.BlobID, &rec.PatchID, &rec.Offset, &rec.Size, &rec.Deletable, &endEpoch, &rec.ExpiresAt)
+	err := p.db.QueryRowContext(ctx, q, key).Scan(&rec.BlobID, &rec.ObjectID, &rec.PatchID, &rec.Offset, &rec.Size, &rec.Deletable, &endEpoch, &rec.ExpiresAt)
 	switch {
 	case err == sql.ErrNoRows:
 		return Record{}, ds.ErrNotFound
@@ -332,11 +343,13 @@ func (p *postgresIndex) DueForRenewal(ctx context.Context, before time.Time, lim
 // UpdateBlobAfterRenewal points every block that lived in oldBlobID at the
 // freshly re-uploaded blob and records its new epoch window. Because Walrus is
 // content-addressed, re-uploading identical bytes typically yields the same
-// blob ID; we still write newBlobID so the index is correct either way. Byte
-// offsets are unchanged (the packfile bytes are identical).
-func (p *postgresIndex) UpdateBlobAfterRenewal(ctx context.Context, oldBlobID, newBlobID string, endEpoch uint64, expiresAt sql.NullTime) error {
-	q := fmt.Sprintf(`UPDATE %s SET blob_id = $2, end_epoch = $3, expires_at = $4, updated_at = now() WHERE blob_id = $1`, p.table)
-	if _, err := p.db.ExecContext(ctx, q, oldBlobID, newBlobID, int64(endEpoch), expiresAt); err != nil {
+// blob ID; we still write newBlobID so the index is correct either way. A
+// re-upload creates a new Sui Blob object, so newObjectID is recorded too (it
+// is what future in-place extends need). Byte offsets are unchanged (the
+// packfile bytes are identical).
+func (p *postgresIndex) UpdateBlobAfterRenewal(ctx context.Context, oldBlobID, newBlobID, newObjectID string, endEpoch uint64, expiresAt sql.NullTime) error {
+	q := fmt.Sprintf(`UPDATE %s SET blob_id = $2, object_id = $3, end_epoch = $4, expires_at = $5, updated_at = now() WHERE blob_id = $1`, p.table)
+	if _, err := p.db.ExecContext(ctx, q, oldBlobID, newBlobID, newObjectID, int64(endEpoch), expiresAt); err != nil {
 		return fmt.Errorf("walrusds: updating renewed blob %q: %w", oldBlobID, err)
 	}
 	return nil

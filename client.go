@@ -23,10 +23,17 @@ import (
 var ErrBlobNotFound = errors.New("walrusds: blob not found")
 
 // StoreResult is the subset of a Walrus publisher "store" response that we
-// care about: the resulting blob ID and the epoch at which the blob's paid
-// storage ends.
+// care about: the resulting blob ID, the Sui object ID of the created Blob
+// object, and the epoch at which the blob's paid storage ends.
+//
+// ObjectID is the on-chain Sui object that owns the blob's storage; it is what
+// `walrus extend` needs to renew the blob in place (the blob ID alone is not
+// enough). It is only present when the publisher newly created the blob object
+// (the "newlyCreated" response); for an "alreadyCertified" response no new
+// owned object is returned and ObjectID is empty.
 type StoreResult struct {
 	BlobID   string
+	ObjectID string
 	EndEpoch uint64
 }
 
@@ -47,9 +54,11 @@ type QuiltPatch struct {
 
 // QuiltStoreResult is the parsed result of a store-quilt call: the quilt's own
 // blob ID (used for renewal/extension, since the quilt is itself one Walrus
-// blob), the epoch its paid storage ends, and the per-part patch IDs.
+// blob), the Sui object ID of that quilt blob (for in-place `walrus extend`),
+// the epoch its paid storage ends, and the per-part patch IDs.
 type QuiltStoreResult struct {
 	QuiltID  string
+	ObjectID string
 	EndEpoch uint64
 	Patches  []QuiltPatch
 }
@@ -535,6 +544,7 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 type storeResponse struct {
 	NewlyCreated *struct {
 		BlobObject struct {
+			ID      string `json:"id"`
 			BlobID  string `json:"blobId"`
 			Size    int64  `json:"size"`
 			Storage struct {
@@ -556,9 +566,13 @@ func (sr storeResponse) result() (StoreResult, error) {
 	case sr.NewlyCreated != nil && sr.NewlyCreated.BlobObject.BlobID != "":
 		return StoreResult{
 			BlobID:   sr.NewlyCreated.BlobObject.BlobID,
+			ObjectID: sr.NewlyCreated.BlobObject.ID,
 			EndEpoch: sr.NewlyCreated.BlobObject.Storage.EndEpoch,
 		}, nil
 	case sr.AlreadyCertified != nil && sr.AlreadyCertified.BlobID != "":
+		// No new owned Sui object is created for an already-certified blob, so
+		// ObjectID is left empty; in-place extend is unavailable for this row
+		// and renewal falls back to re-upload.
 		return StoreResult{
 			BlobID:   sr.AlreadyCertified.BlobID,
 			EndEpoch: sr.AlreadyCertified.EndEpoch,
@@ -625,6 +639,7 @@ func parseQuiltStoreResponse(res *http.Response) (QuiltStoreResult, error) {
 
 	return QuiltStoreResult{
 		QuiltID:  blob.BlobID,
+		ObjectID: blob.ObjectID,
 		EndEpoch: blob.EndEpoch,
 		Patches:  patches,
 	}, nil
