@@ -241,6 +241,7 @@ func (w *WalrusDatastore) Put(ctx context.Context, k ds.Key, value []byte) error
 
 	rec := Record{
 		BlobID:    res.BlobID,
+		ObjectID:  res.ObjectID,
 		Offset:    0,
 		Size:      int64(len(value)),
 		Deletable: w.conf.Deletable,
@@ -538,6 +539,7 @@ func (w *WalrusDatastore) storeSingleBlock(ctx context.Context, e blockEntry) er
 	}
 	rec := Record{
 		BlobID:    res.BlobID,
+		ObjectID:  res.ObjectID,
 		Offset:    0,
 		Size:      int64(len(e.val)),
 		Deletable: w.conf.Deletable,
@@ -581,6 +583,7 @@ func (w *WalrusDatastore) storeQuiltPack(ctx context.Context, pack []blockEntry)
 			Key: key,
 			Rec: Record{
 				BlobID:    res.QuiltID,
+				ObjectID:  res.ObjectID,
 				PatchID:   p.QuiltPatchID,
 				Offset:    0,
 				Size:      sizeByID[p.Identifier],
@@ -625,6 +628,7 @@ func (w *WalrusDatastore) storeConcatPack(ctx context.Context, pack []blockEntry
 	expiry := w.expiry()
 	for i := range recs {
 		recs[i].Rec.BlobID = res.BlobID
+		recs[i].Rec.ObjectID = res.ObjectID
 		recs[i].Rec.Deletable = w.conf.Deletable
 		recs[i].Rec.EndEpoch = res.EndEpoch
 		recs[i].Rec.ExpiresAt = expiry

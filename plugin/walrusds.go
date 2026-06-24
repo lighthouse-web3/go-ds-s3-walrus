@@ -25,7 +25,7 @@ func (WalrusPlugin) Name() string {
 }
 
 func (WalrusPlugin) Version() string {
-	return "0.2.0"
+	return "0.3.0"
 }
 
 func (WalrusPlugin) Init(*plugin.Environment) error {

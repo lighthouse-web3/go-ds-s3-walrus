@@ -75,10 +75,11 @@ func (w *WalrusDatastore) renewExpiring(ctx context.Context, lead time.Duration)
 // (no Sui key) at the cost of one round-trip per blob near expiry, regardless
 // of how many IPFS blocks the blob holds.
 //
-// Operators who run the Walrus CLI with a funded Sui key can instead extend a
-// blob in place (`walrus extend --blob-id <id> --epochs N`), which avoids
-// re-downloading and re-uploading the bytes; that path is out of scope here
-// because this datastore is deliberately HTTP-only and holds no Sui key.
+// This background worker is deliberately HTTP-only and holds no Sui key, so it
+// always renews by re-upload. Operators who want to avoid re-downloading and
+// re-uploading can instead extend blobs in place with a funded Sui key using
+// the external renew.js tool (Walrus SDK `extend`), which uses the object_id
+// recorded per row at store time. See js/renew.js.
 func (w *WalrusDatastore) renewOneBlob(ctx context.Context, it RenewItem) error {
 	return renewBlob(ctx, w.client, w.index, it.BlobID, w.conf.Epochs, w.conf.Deletable, w.conf.EpochDuration)
 }
@@ -111,5 +112,5 @@ func renewBlob(ctx context.Context, client *Client, index Index, blobID string, 
 			Valid: true,
 		}
 	}
-	return index.UpdateBlobAfterRenewal(ctx, blobID, res.BlobID, res.EndEpoch, expiresAt)
+	return index.UpdateBlobAfterRenewal(ctx, blobID, res.BlobID, res.ObjectID, res.EndEpoch, expiresAt)
 }
