@@ -39,6 +39,7 @@ Created automatically on first start:
 CREATE TABLE walrus_index (
   key         TEXT PRIMARY KEY,   -- ds.Key string, e.g. "/blocks/CIQ..."
   blob_id     TEXT NOT NULL,      -- Walrus blob ID (for a quilt, the quilt's own blob ID)
+  object_id   TEXT NOT NULL DEFAULT '', -- Sui object ID of the Blob object (for in-place `walrus extend`); '' if unknown
   patch_id    TEXT NOT NULL DEFAULT '', -- QuiltPatchID when the block is a quilt member; '' otherwise
   blob_offset BIGINT NOT NULL DEFAULT 0, -- byte offset within the blob (concat/plain rows only)
   size        BIGINT NOT NULL,    -- block length
@@ -61,8 +62,10 @@ aggregator's `by-quilt-patch-id` endpoint, so only the requested block transfers
 Set `disableQuilt: true` to fall back to the **legacy concat scheme** instead: blocks are
 concatenated into one opaque blob and addressed by `blob_offset`/`size`, read back via HTTP
 `Range` (with a cached whole-blob fallback). A single (non-batch) `Put`, or any group that ends
-up with exactly one block, is always stored as a plain blob (`patch_id = ''`). Existing repos
-upgrade transparently: the `patch_id`/`blob_offset` columns default to `''`/`0`, so legacy rows
+up with exactly one block, is always stored as a plain blob (`patch_id = ''`). The plugin records
+`object_id` (the blob's Sui object) at store time so external tooling can extend the blob in place;
+it is `''` for legacy rows and for already-certified uploads. Existing repos
+upgrade transparently: the `object_id`/`patch_id`/`blob_offset` columns default to `''`/`''`/`0`, so legacy rows
 keep working unchanged.
 
 `packTargetSizeBytes` is a **ceiling, not a floor** — a small file uploads immediately as a
@@ -267,139 +270,16 @@ that happens the IPFS block is gone even though the Postgres row survives. Stay 
    updates the index. HTTP-only (no Sui key required). This renews **everything** — leave these
    unset if you only want to renew selected content.
 3. **Renewing selected content yourself:** keep auto-renewal **off** (don't set
-   `epochDurationSeconds`/`renewIntervalSeconds`) and run the bundled **JS scripts** against the
-   content you choose — e.g. only paying users' CIDs. See below.
+   `epochDurationSeconds`/`renewIntervalSeconds`)
 
 The default `epochs: 1` expires quickly — fine for testing, **not** for production.
-
-### Operator scripts (`../js`)
-
-Renewal, inspection, registration, and deletion are handled by Node.js scripts that talk straight
-to Postgres + Walrus (no running Kubo node or Sui key required for renewal; the others use the Kubo
-HTTP API to expand DAGs). They live in the [`js/`](../js) directory at the repo root (a sibling of
-this Go module). Install once:
-
-```bash
-cd ../js && npm install   # needs Node >= 18
-```
-
-All scripts share these conventions: endpoints/DSN read from `WALRUS_PUBLISHER_URL`,
-`WALRUS_AGGREGATOR_URL`, `WALRUS_POSTGRES_URL`, `WALRUS_TABLE`; the Kubo API defaults to
-`http://127.0.0.1:5001` (`--api` / `IPFS_API_URL`); pass `--key-prefix /blocks` only if walrusds is
-your **root** datastore rather than the `/blocks` mount; set `WALRUS_PG_SSL_NO_VERIFY=1` for
-self-signed Postgres TLS.
-
-#### Selective renewal (`renew.js`)
-
-Renews only the CIDs (or raw datastore keys) you give it. Many keys can share one blob (a
-quilt/pack), so each underlying blob is renewed at most once. A file is a DAG of many blocks, so
-expand each root CID to all of its block CIDs first:
-
-```bash
-( echo "$ROOT_CID"; ipfs refs -r "$ROOT_CID" ) | node renew.js \
-  --publisher "$WALRUS_PUBLISHER_URL" \
-  --aggregator "$WALRUS_AGGREGATOR_URL" \
-  --postgres "$WALRUS_POSTGRES_URL" \
-  --epochs 53
-# prints: requested=N missing=N blobs_renewed=N blobs_failed=N
-```
-
-Drive it from your billing system: collect the active (paying) users' root CIDs, expand them, and
-feed the combined list. Anything you don't feed simply expires. Extra flags: `--input cids|keys`
-(default `cids`), `--concurrency` (parallel blob renewals, default 8), `--dry-run`,
-`--epoch-duration-seconds` (set `expires_at` on renewed rows), `--max-retries`.
-
-### Inspecting a file (`js/inspect.js`)
-
-Before renewing or forgetting, see exactly which keys and Walrus blobs a file occupies and when it
-expires. `inspect.js` expands the file's DAG via the Kubo HTTP API, maps each block CID to its
-datastore key, and looks each key up in the index:
-
-```bash
-node inspect.js "$ROOT_CID" \
-  --postgres "$WALRUS_POSTGRES_URL" \
-  --api http://127.0.0.1:5001
-# per-block table: present?, size, blob_id (quilt), patch_id, key
-# summary: blocks present/missing, distinct Walrus blobs, total size, expires_at range
-```
-
-Add `--dag` to also dump the root node (dag-json) and `--json` for machine-readable output.
-
-### Registering files for reference-counted deletion (`js/register.js`)
-
-`register.js` records which blocks belong to which file in an edge table
-(`walrus_file_blocks(root_cid, key)`, created automatically) so deletion can be made safe by
-**reference count** instead of by enumerating a keep-set. Run it whenever you add/pin a file (it is
-idempotent — re-running inserts nothing new):
-
-```bash
-node register.js "$ROOT_CID" \
-  --postgres "$WALRUS_POSTGRES_URL" --api http://127.0.0.1:5001
-# prints: roots=N edges=N new_edges=N failed=N
-
-# Backfill the table from everything currently pinned (do this once before
-# first using --use-refcounts):
-node register.js --from-pinned \
-  --postgres "$WALRUS_POSTGRES_URL" --api http://127.0.0.1:5001
-```
-
-The edge table is the source of truth for who references a block, so `--use-refcounts` deletion is
-only safe if **every file you keep has been registered**. Use `--dry-run` to preview, `--json` for
-machine output, and `--edges-table` (`WALRUS_EDGES_TABLE`) to rename the table.
-
-### Forgetting a file safely (`js/forget.js`)
-
-To stop paying for a file you won't renew, delete its index rows. The catch: IPFS de-duplicates,
-so two files can **share** a block (one row), and deleting it would corrupt the other file.
-`forget.js` deletes only blocks **unique** to the file(s) you name, in one of two modes. It edits
-Postgres only; freed Walrus blobs then expire on their own (a removed member's bytes linger inside a
-shared quilt until the whole blob expires). It is a **dry run by default** — pass `--confirm` to
-actually delete.
-
-**Keep-set mode (default).** Expands the forgotten file's DAG, subtracts the DAG of every file you
-keep (`--keep` / `--keep-pinned`), and deletes the difference. Stateless, but you must name what to
-keep:
-
-```bash
-# Protect everything still pinned on the node, unpin the target, then delete its unique rows:
-node forget.js "$ROOT_CID" \
-  --postgres "$WALRUS_POSTGRES_URL" \
-  --api http://127.0.0.1:5001 \
-  --keep-pinned --unpin --confirm
-
-# Or protect an explicit keep-list instead of the pinset:
-node forget.js bafyTARGET --keep bafyKEEP1,bafyKEEP2 \
-  --postgres "$WALRUS_POSTGRES_URL" --confirm
-# prints: targets=… target_blocks=… shared_protected=… deletable=… rows_deleted=…
-```
-
-Always supply `--keep-pinned` and/or `--keep` so shared blocks are protected; with neither, nothing
-is treated as protected and the tool warns you.
-
-**Reference-count mode (`--use-refcounts`).** Uses the `register.js` edge table to decide safety: a
-block is deleted only when **no other registered file** still references it. This scales without
-enumerating keepers and does not need the Kubo node (keys come from the edge table). The whole
-decide-and-delete runs as one atomic SQL statement:
-
-```bash
-node forget.js "$ROOT_CID" --use-refcounts \
-  --postgres "$WALRUS_POSTGRES_URL" --confirm
-# prints: mode=refcounts targets=… target_blocks=… shared_protected=… deletable=…
-#         rows_deleted=… blobs_fully_freed=… blobs_still_shared=…
-```
-
-This is only safe if every file you keep was registered (see `register.js --from-pinned` for
-backfill). For strict per-user accounting in either mode, keep each user's blocks in separate
-`Batch.Commit`s (separate quilts), since renewal and blob expiry operate per backing blob.
 
 ## Limitations
 
 - `Delete` removes the Postgres row only; it does not delete the blob on Walrus (on-chain
   deletion needs a Sui key, out of scope). Unreferenced blobs simply expire. With packing, a
   deleted block's bytes also remain inside its shared blob until the whole blob expires —
-  reclaiming that space would need a future compaction/GC pass. To drop a whole file's rows
-  without breaking files that share blocks, use [`forget.js`](../js/forget.js) (with
-  [`register.js`](../js/register.js) for reference-counted deletion).
+  reclaiming that space would need a future compaction/GC pass.
 - Block-packing batches blocks written through `Batch().Commit()` (e.g. `ipfs add`). A single
   `Put` outside a batch still writes one blob per block, since a lone `Put` must be durable on
   return.

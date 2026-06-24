@@ -70,33 +70,37 @@ We worked through several options before landing here:
   `Import.UnixFSChunker = size-1048576` (1 MiB). Sweet spot is ~32–64 MiB (diminishing per-blob
   cost savings vs. rising memory/read-amplification beyond that); Walrus max blob size is
   13.6 GiB.
-- **Epoch renewal via re-upload** (HTTP-only, no Sui key): re-uploads blobs **per distinct
-  `blob_id`** (so a packed blob / quilt is renewed once, not once per block), then repoints all
-  member rows. Two ways to drive it, sharing one core (`renewBlob` in `renewal.go`):
-  - **Automatic (opt-in):** background worker, enabled only when `epochDurationSeconds` +
-    `renewIntervalSeconds` are set. It scans `expires_at` and renews everything due. **Leave
-    these unset to disable auto-renewal** (the common choice when the operator wants to renew
-    selectively, e.g. only paying users).
+- **Epoch renewal — per distinct `blob_id`** (so a packed blob / quilt is renewed once, not once
+  per block). Two mechanisms and two ways to drive them:
+  - **Mechanisms:**
+    1. *Extend (preferred, no data movement):* extend the blob's lifetime on-chain via the Walrus
+       TS SDK (`executeExtendBlobTransaction`) using the blob's Sui **object id**. To make this
+       possible the plugin now records `object_id` per row at store time
+       (`newlyCreated.blobObject.id` from the publisher store/quilt response → `Record.ObjectID` →
+       `object_id` column). Needs a funded Sui key (SUI gas + WAL) that **owns** the blob, and the
+       blob must not be expired. Only `js/renew.js` does this (the Go side holds no key).
+    2. *Re-upload (fallback, HTTP-only):* read the whole blob (`GET /v1/blobs/{id}`) and re-store
+       the identical bytes (`PUT /v1/blobs`). Because Walrus blob IDs are content-derived, the
+       re-uploaded quilt keeps the **same** quilt ID and member `QuiltPatchId`s, so `patch_id` rows
+       stay valid and only `end_epoch`/`expires_at`/`object_id` change. A re-upload creates a new
+       Sui object, so `UpdateBlobAfterRenewal` also rewrites `object_id`.
+  - **Automatic (opt-in):** background worker (`renewal.go`), enabled only when
+    `epochDurationSeconds` + `renewIntervalSeconds` are set. It scans `expires_at` and renews
+    everything due **by re-upload** (deliberately HTTP-only, no Sui key). **Leave these unset to
+    disable auto-renewal** (the common choice when renewing selectively, e.g. only paying users).
   - **Manual / external (default for selective renewal):** the Node.js script `js/renew.js`
-    (`pg` + `multiformats`), the supported tool for selective renewal. (The former Go
-    `Renewer`/`cmd/walrus-renew` were removed in favor of the JS scripts, which now live in
-    `js/` at the repo root — a sibling of this Go module.) The operator supplies the CIDs (or raw
-    datastore keys) to keep alive; the tool resolves them to distinct Walrus blobs and re-uploads
-    each. Connects straight to Postgres + Walrus, no running Kubo node needed. To renew whole
-    files, expand each root CID to all its block CIDs first
-    (`( echo "$ROOT"; ipfs refs -r "$ROOT" ) | node renew.js ...`). CID→key mapping is base32 of
-    the multihash with a configurable `--key-prefix` (default "", i.e. blocks datastore mounted at
-    `/blocks`; use `/blocks` if walrusds is the root datastore).
+    (`pg` + `multiformats` + `@mysten/walrus`/`@mysten/sui`). It expands each root CID to its whole
+    block DAG itself (via the Kubo API), resolves blocks to distinct Walrus blobs, then per blob
+    tries *extend* (when `--sui-key`/`SUI_PRIVATE_KEY` is set and `object_id` is present) and falls
+    back to *re-upload* (unless `--no-fallback`). `--epochs N` means "add N epochs" for extend and
+    "fresh N-epoch window" for re-upload. Extend txs run serially (one signer → avoid gas-coin
+    conflicts); re-upload honours `--concurrency`. (The former Go `Renewer`/`cmd/walrus-renew` were
+    removed in favor of these JS scripts, which live in `js/` — a sibling of this Go module.)
+    CID→key mapping is base32 of the multihash with a configurable `--key-prefix` (default "",
+    i.e. blocks datastore mounted at `/blocks`; use `/blocks` if walrusds is the root datastore).
   - **Packing caveat for per-user billing:** renewing one key renews its *whole* backing blob,
     including any other users' blocks packed in the same quilt/pack. For strict per-user
-    accounting, keep each user's blocks in separate commits so they land in separate quilts. For a quilt, `blob_id` is the quilt ID; the worker reads the
-  whole quilt blob (`GET /v1/blobs/{quiltId}`) and re-stores the identical bytes
-  (`PUT /v1/blobs`). Because Walrus blob IDs are content-derived, the re-uploaded quilt keeps the
-  **same** quilt ID, and member `QuiltPatchId`s (quilt ID + position) are therefore unchanged —
-  so existing `patch_id` rows stay valid and only `end_epoch`/`expires_at` are refreshed.
-  Alternative for operators with a funded Sui key + CLI: `walrus extend --blob-id <id> --epochs N`
-  extends storage in place without re-downloading/re-uploading the bytes (out of scope here since
-  the datastore is deliberately HTTP-only and holds no Sui key).
+    accounting, keep each user's blocks in separate commits so they land in separate quilts.
 - **Lifecycle / safe deletion (JS scripts in `js/`).** Besides `renew.js`: `inspect.js` shows a
   file's keys/blobs/expiry; `register.js` records `file_blocks(root_cid, key)` edges (idempotent,
   via `ipfs refs -r`); `forget.js` deletes a file's index rows **without corrupting shared files**.
@@ -126,8 +130,8 @@ go-ds-s3-walrus/
   walrus.go      # WalrusDatastore: ds.Datastore + ds.Batching; packing in Batch.Commit (package walrusds, at root)
   client.go      # context-aware Walrus HTTP client (blob store/read, range read, quilt store + patch read, retries, failover)
   cache.go       # byte-bounded LRU of whole blobs / quilt patches to serve packed reads
-  index.go       # Index interface + postgresIndex (auto-migrate, upsert, put-many, get, delete[-many], list, per-blob renewal; rows carry blob_id + patch_id)
-  renewal.go     # opt-in background epoch-renewal worker + shared renewBlob core (per blob)
+  index.go       # Index interface + postgresIndex (auto-migrate, upsert, put-many, get, delete[-many], list, per-blob renewal; rows carry blob_id + object_id + patch_id)
+  renewal.go     # opt-in background epoch-renewal worker + shared renewBlob core (per blob, re-upload)
   client_test.go # quilt multipart streaming tests (length invariant + httptest round-trip)
   plugin/
     walrusds.go        # WalrusPlugin + config parser + Plugins var (package plugin)
@@ -136,12 +140,14 @@ go-ds-s3-walrus/
   Makefile, set-target.sh, go.mod, README.md, CONTEXT.md, LICENSE, version.json
 
 js/                # operator scripts, repo root (sibling of the Go module above)
+  README.md                # install, config, usage, large-file notes
   common.js                # shared helpers (CID→key, normalizeCid, pg pool, IPFS API, edges table)
-  renew.js                 # selective renewal (CIDs/keys → distinct blobs → re-upload → index)
+  renew.js                 # selective renewal: roots → DAG → distinct blobs → extend (Sui SDK) or re-upload → index
   inspect.js               # show a file's keys/blobs/patch-ids/expiry
   register.js              # record file_blocks(root_cid,key) edges (+ --from-pinned backfill)
   forget.js                # safe deletion: keep-set (default) or --use-refcounts
-  package.json             # bins: walrus-renew/inspect/register/forget (pg + multiformats)
+  .env.example             # dotenv template (Postgres/IPFS/Walrus/Sui config)
+  package.json             # bins: walrus-renew/inspect/register/forget (pg + multiformats + @mysten/walrus + @mysten/sui)
 ```
 
 Module path: `github.com/lighthouse-web3/go-ds-s3-walrus`.
@@ -176,8 +182,8 @@ Datastore type name registered with Kubo: `walrusds`.
    read efficiency on packed blobs.
 5. **Delete fragments packed blobs** — logical `Delete` drops the index row but the bytes stay
    inside the shared blob; reclaiming space needs a future compaction/GC pass (read live
-   blocks, repack, let the old blob expire). Renewal currently re-uploads whole packfiles
-   including any dead bytes.
+   blocks, repack, let the old blob expire). Re-upload renewal carries any dead bytes along; the
+   `renew.js` *extend* path leaves the blob untouched (so it keeps the same dead weight too).
 6. **Pack sizing** — `packTargetSizeBytes` defaults to 8 MiB to stay under the 10 MiB public
    limit. Self-hosted publishers/aggregators can raise it; bigger packs amortize cost more but
    waste more transfer on partial reads (without Range) and carry more dead weight after
