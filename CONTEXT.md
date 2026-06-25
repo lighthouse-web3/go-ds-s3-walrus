@@ -111,6 +111,23 @@ We worked through several options before landing here:
   orphan check is correct under Postgres' data-modifying-CTE snapshot semantics). The edge table is
   thus an index-level pinset; it must be backfilled (`register.js --from-pinned`) for refcount mode
   to be safe.
+- **Per-blob billing / datacap (encoded size).** Walrus bills by a blob's *encoded* size
+  (RedStuff erasure coding ~5x + a fixed ~64 MiB/blob metadata overhead on a 1000-shard
+  committee), **not** the raw byte count IPFS reports. The plugin now records this per blob:
+  the publisher store/quilt response's `storage.storageSize` (== `resourceOperation.encodedLength`)
+  → `StoreResult.EncodedSize`/`QuiltStoreResult.EncodedSize` → `Record.EncodedSize` → `encoded_size`
+  column, plus the WAL actually paid (`newlyCreated.cost`, FROST) → `cost` column. Both are
+  **blob-level**: every row sharing a `blob_id` (all quilt members, all concat-pack blocks) gets
+  the same numbers, so per-file datacap = sum over **DISTINCT `blob_id`**. For an
+  already-certified (deduplicated) blob the response omits the size and pays nothing, so
+  `encoded_size` is filled in by computing `EncodedBlobLength(unencoded, nShards)` (RS2 formula in
+  `encoding.go`, verified exact: 17 B → 66,034,000 B) and `cost` is 0. `nShards` config defaults
+  to `DefaultNShards` (1000). Per-file query (needs the `file_blocks` edge table from
+  `register.js`):
+  `SELECT SUM(encoded_size) FROM (SELECT DISTINCT wi.blob_id, wi.encoded_size FROM file_blocks fb JOIN walrus_index wi ON wi.key=fb.key WHERE fb.root_cid=$1) t;`
+  Caveat: a quilt shared across users attributes the whole quilt's datacap to each file that uses
+  it, so for strict per-user accounting keep each user's blocks in their own commit (→ own quilt),
+  as already noted under packing.
 - `deletable` defaults to `false`. `Delete` is logical (removes index row only); no on-chain
   Walrus deletion (would need a Sui key).
 - `postgresURL` kept OUT of `DiskSpec` (it carries credentials).

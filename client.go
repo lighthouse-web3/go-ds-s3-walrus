@@ -35,6 +35,16 @@ type StoreResult struct {
 	BlobID   string
 	ObjectID string
 	EndEpoch uint64
+	// EncodedSize is the blob's Walrus *encoded* size in bytes (the billed
+	// "datacap": erasure-coded size plus per-blob metadata), as reported by the
+	// publisher via storage.storageSize / resourceOperation.encodedLength. It is
+	// zero for an already-certified (deduplicated) blob, whose response omits
+	// it; callers can fill it in with EncodedBlobLength.
+	EncodedSize int64
+	// Cost is the WAL actually paid for this store, in FROST (1 WAL = 1e9
+	// FROST). It is zero for an already-certified blob (nothing was paid because
+	// the content already existed on Walrus).
+	Cost uint64
 }
 
 // QuiltPart is a single small blob (an IPFS block) to be batched into a quilt.
@@ -60,7 +70,13 @@ type QuiltStoreResult struct {
 	QuiltID  string
 	ObjectID string
 	EndEpoch uint64
-	Patches  []QuiltPatch
+	// EncodedSize is the whole quilt's Walrus encoded size in bytes (the billed
+	// datacap shared by all members). Zero if the quilt was already certified.
+	EncodedSize int64
+	// Cost is the WAL paid for the quilt store, in FROST. Zero if already
+	// certified.
+	Cost    uint64
+	Patches []QuiltPatch
 }
 
 // Client is a small, context-aware HTTP client for the Walrus publisher
@@ -550,8 +566,20 @@ type storeResponse struct {
 			Storage struct {
 				StartEpoch uint64 `json:"startEpoch"`
 				EndEpoch   uint64 `json:"endEpoch"`
+				// StorageSize is the encoded size (datacap) the storage resource
+				// was reserved for; it equals resourceOperation.encodedLength.
+				StorageSize int64 `json:"storageSize"`
 			} `json:"storage"`
 		} `json:"blobObject"`
+		// ResourceOperation echoes the encoded length charged for; we read it as
+		// a fallback when storage.storageSize is absent.
+		ResourceOperation struct {
+			RegisterFromScratch *struct {
+				EncodedLength int64 `json:"encodedLength"`
+			} `json:"registerFromScratch"`
+		} `json:"resourceOperation"`
+		// Cost is the WAL paid for this store, in FROST.
+		Cost uint64 `json:"cost"`
 	} `json:"newlyCreated"`
 	AlreadyCertified *struct {
 		BlobID   string `json:"blobId"`
@@ -564,10 +592,16 @@ type storeResponse struct {
 func (sr storeResponse) result() (StoreResult, error) {
 	switch {
 	case sr.NewlyCreated != nil && sr.NewlyCreated.BlobObject.BlobID != "":
+		encoded := sr.NewlyCreated.BlobObject.Storage.StorageSize
+		if encoded == 0 && sr.NewlyCreated.ResourceOperation.RegisterFromScratch != nil {
+			encoded = sr.NewlyCreated.ResourceOperation.RegisterFromScratch.EncodedLength
+		}
 		return StoreResult{
-			BlobID:   sr.NewlyCreated.BlobObject.BlobID,
-			ObjectID: sr.NewlyCreated.BlobObject.ID,
-			EndEpoch: sr.NewlyCreated.BlobObject.Storage.EndEpoch,
+			BlobID:      sr.NewlyCreated.BlobObject.BlobID,
+			ObjectID:    sr.NewlyCreated.BlobObject.ID,
+			EndEpoch:    sr.NewlyCreated.BlobObject.Storage.EndEpoch,
+			EncodedSize: encoded,
+			Cost:        sr.NewlyCreated.Cost,
 		}, nil
 	case sr.AlreadyCertified != nil && sr.AlreadyCertified.BlobID != "":
 		// No new owned Sui object is created for an already-certified blob, so
@@ -638,9 +672,11 @@ func parseQuiltStoreResponse(res *http.Response) (QuiltStoreResult, error) {
 	}
 
 	return QuiltStoreResult{
-		QuiltID:  blob.BlobID,
-		ObjectID: blob.ObjectID,
-		EndEpoch: blob.EndEpoch,
-		Patches:  patches,
+		QuiltID:     blob.BlobID,
+		ObjectID:    blob.ObjectID,
+		EndEpoch:    blob.EndEpoch,
+		EncodedSize: blob.EncodedSize,
+		Cost:        blob.Cost,
+		Patches:     patches,
 	}, nil
 }

@@ -81,7 +81,7 @@ func (w *WalrusDatastore) renewExpiring(ctx context.Context, lead time.Duration)
 // the external renew.js tool (Walrus SDK `extend`), which uses the object_id
 // recorded per row at store time. See js/renew.js.
 func (w *WalrusDatastore) renewOneBlob(ctx context.Context, it RenewItem) error {
-	return renewBlob(ctx, w.client, w.index, it.BlobID, w.conf.Epochs, w.conf.Deletable, w.conf.EpochDuration)
+	return renewBlob(ctx, w.client, w.index, it.BlobID, w.conf.Epochs, w.conf.Deletable, w.conf.EpochDuration, w.conf.NShards)
 }
 
 // renewBlob refreshes one Walrus blob's paid storage and repoints every index
@@ -95,7 +95,7 @@ func (w *WalrusDatastore) renewOneBlob(ctx context.Context, it RenewItem) error 
 // renews all of them at once. For a quilt, blobID is the quilt ID and the
 // member QuiltPatchIds are unchanged by re-upload, so existing patch_id rows
 // stay valid.
-func renewBlob(ctx context.Context, client *Client, index Index, blobID string, epochs int, deletable bool, epochDuration time.Duration) error {
+func renewBlob(ctx context.Context, client *Client, index Index, blobID string, epochs int, deletable bool, epochDuration time.Duration, nShards int) error {
 	data, err := client.Read(ctx, blobID)
 	if err != nil {
 		return err
@@ -105,6 +105,15 @@ func renewBlob(ctx context.Context, client *Client, index Index, blobID string, 
 		return err
 	}
 
+	// The bytes are identical, so the encoded size is unchanged; prefer the
+	// publisher's freshly reported figure and fall back to computing it from the
+	// blob length (exact for a re-upload, which is a single plain blob). cost is
+	// whatever the renewal store actually paid.
+	encoded := res.EncodedSize
+	if encoded <= 0 {
+		encoded = EncodedBlobLength(int64(len(data)), nShards)
+	}
+
 	var expiresAt sql.NullTime
 	if epochDuration > 0 {
 		expiresAt = sql.NullTime{
@@ -112,5 +121,5 @@ func renewBlob(ctx context.Context, client *Client, index Index, blobID string, 
 			Valid: true,
 		}
 	}
-	return index.UpdateBlobAfterRenewal(ctx, blobID, res.BlobID, res.ObjectID, res.EndEpoch, expiresAt)
+	return index.UpdateBlobAfterRenewal(ctx, blobID, res.BlobID, res.ObjectID, encoded, res.Cost, res.EndEpoch, expiresAt)
 }

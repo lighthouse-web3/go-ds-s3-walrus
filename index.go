@@ -32,10 +32,21 @@ type Record struct {
 	// to extend the blob in place via `walrus extend` instead of re-uploading.
 	// It may be empty for legacy rows written before object IDs were tracked,
 	// or when the publisher returned an already-certified blob (no owned object).
-	ObjectID  string
-	PatchID   string
-	Offset    int64
-	Size      int64
+	ObjectID string
+	PatchID  string
+	Offset   int64
+	Size     int64
+	// EncodedSize is the Walrus *encoded* size (datacap, in bytes) of the whole
+	// backing blob/quilt this row lives in — the billed figure, which includes
+	// erasure-coding expansion and per-blob metadata. It is a blob-level value:
+	// every row sharing a blob_id (all members of a quilt, all blocks of a
+	// concat pack) records the same number, so per-file datacap is summed over
+	// DISTINCT blob_id. Zero on legacy rows written before billing was tracked.
+	EncodedSize int64
+	// Cost is the WAL actually paid for the backing blob, in FROST (1 WAL = 1e9
+	// FROST), also blob-level. Zero when the blob was deduplicated
+	// (already-certified) so nothing was paid, or on legacy rows.
+	Cost      uint64
 	Deletable bool
 	EndEpoch  uint64
 	ExpiresAt sql.NullTime
@@ -71,7 +82,7 @@ type Index interface {
 	DeleteMany(ctx context.Context, keys []string) error
 	List(ctx context.Context, prefix string, limit, offset int) ([]ListItem, error)
 	DueForRenewal(ctx context.Context, before time.Time, limit int) ([]RenewItem, error)
-	UpdateBlobAfterRenewal(ctx context.Context, oldBlobID, newBlobID, newObjectID string, endEpoch uint64, expiresAt sql.NullTime) error
+	UpdateBlobAfterRenewal(ctx context.Context, oldBlobID, newBlobID, newObjectID string, encodedSize int64, cost uint64, endEpoch uint64, expiresAt sql.NullTime) error
 	Close() error
 }
 
@@ -89,7 +100,7 @@ const putManyChunk = 500
 
 // putManyParams is the number of bound parameters per row in PutMany's
 // multi-row INSERT (created_at/updated_at use now() and bind nothing).
-const putManyParams = 9
+const putManyParams = 11
 
 // newPostgresIndex opens the Postgres connection, verifies connectivity and
 // ensures the backing table and indexes exist. maxOpenConns bounds the
@@ -140,6 +151,8 @@ func (p *postgresIndex) migrate(ctx context.Context) error {
 			patch_id    TEXT NOT NULL DEFAULT '',
 			blob_offset BIGINT NOT NULL DEFAULT 0,
 			size        BIGINT NOT NULL,
+			encoded_size BIGINT NOT NULL DEFAULT 0,
+			cost        BIGINT NOT NULL DEFAULT 0,
 			deletable   BOOLEAN NOT NULL DEFAULT FALSE,
 			end_epoch   BIGINT NOT NULL DEFAULT 0,
 			expires_at  TIMESTAMPTZ,
@@ -152,6 +165,10 @@ func (p *postgresIndex) migrate(ctx context.Context) error {
 		fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS patch_id TEXT NOT NULL DEFAULT ''`, p.table),
 		// Backward compatibility: repos created before in-place extend lack object_id.
 		fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS object_id TEXT NOT NULL DEFAULT ''`, p.table),
+		// Backward compatibility: repos created before per-blob billing lack the
+		// encoded-size (datacap) and WAL-cost columns.
+		fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS encoded_size BIGINT NOT NULL DEFAULT 0`, p.table),
+		fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS cost BIGINT NOT NULL DEFAULT 0`, p.table),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_key_prefix_idx ON %s (key text_pattern_ops)`, p.table, p.table),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_expires_at_idx ON %s (expires_at)`, p.table, p.table),
 		// Renewal groups by blob_id; packed blobs are touched once per blob.
@@ -166,19 +183,21 @@ func (p *postgresIndex) migrate(ctx context.Context) error {
 }
 
 func (p *postgresIndex) Put(ctx context.Context, key string, rec Record) error {
-	q := fmt.Sprintf(`INSERT INTO %s (key, blob_id, object_id, patch_id, blob_offset, size, deletable, end_epoch, expires_at, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now())
+	q := fmt.Sprintf(`INSERT INTO %s (key, blob_id, object_id, patch_id, blob_offset, size, encoded_size, cost, deletable, end_epoch, expires_at, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now())
 		ON CONFLICT (key) DO UPDATE SET
-			blob_id     = EXCLUDED.blob_id,
-			object_id   = EXCLUDED.object_id,
-			patch_id    = EXCLUDED.patch_id,
-			blob_offset = EXCLUDED.blob_offset,
-			size        = EXCLUDED.size,
-			deletable   = EXCLUDED.deletable,
-			end_epoch   = EXCLUDED.end_epoch,
-			expires_at  = EXCLUDED.expires_at,
-			updated_at  = now()`, p.table)
-	_, err := p.db.ExecContext(ctx, q, key, rec.BlobID, rec.ObjectID, rec.PatchID, rec.Offset, rec.Size, rec.Deletable, int64(rec.EndEpoch), rec.ExpiresAt)
+			blob_id      = EXCLUDED.blob_id,
+			object_id    = EXCLUDED.object_id,
+			patch_id     = EXCLUDED.patch_id,
+			blob_offset  = EXCLUDED.blob_offset,
+			size         = EXCLUDED.size,
+			encoded_size = EXCLUDED.encoded_size,
+			cost         = EXCLUDED.cost,
+			deletable    = EXCLUDED.deletable,
+			end_epoch    = EXCLUDED.end_epoch,
+			expires_at   = EXCLUDED.expires_at,
+			updated_at   = now()`, p.table)
+	_, err := p.db.ExecContext(ctx, q, key, rec.BlobID, rec.ObjectID, rec.PatchID, rec.Offset, rec.Size, rec.EncodedSize, int64(rec.Cost), rec.Deletable, int64(rec.EndEpoch), rec.ExpiresAt)
 	if err != nil {
 		return fmt.Errorf("walrusds: index put %q: %w", key, err)
 	}
@@ -210,27 +229,29 @@ func (p *postgresIndex) PutMany(ctx context.Context, recs []KeyRecord) error {
 			sb   strings.Builder
 			args = make([]interface{}, 0, len(chunk)*putManyParams)
 		)
-		sb.WriteString(fmt.Sprintf(`INSERT INTO %s (key, blob_id, object_id, patch_id, blob_offset, size, deletable, end_epoch, expires_at, created_at, updated_at) VALUES `, p.table))
+		sb.WriteString(fmt.Sprintf(`INSERT INTO %s (key, blob_id, object_id, patch_id, blob_offset, size, encoded_size, cost, deletable, end_epoch, expires_at, created_at, updated_at) VALUES `, p.table))
 		for i, kr := range chunk {
 			if i > 0 {
 				sb.WriteByte(',')
 			}
 			b := i * putManyParams
-			sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,now(),now())",
-				b+1, b+2, b+3, b+4, b+5, b+6, b+7, b+8, b+9))
+			sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,now(),now())",
+				b+1, b+2, b+3, b+4, b+5, b+6, b+7, b+8, b+9, b+10, b+11))
 			args = append(args, kr.Key, kr.Rec.BlobID, kr.Rec.ObjectID, kr.Rec.PatchID, kr.Rec.Offset, kr.Rec.Size,
-				kr.Rec.Deletable, int64(kr.Rec.EndEpoch), kr.Rec.ExpiresAt)
+				kr.Rec.EncodedSize, int64(kr.Rec.Cost), kr.Rec.Deletable, int64(kr.Rec.EndEpoch), kr.Rec.ExpiresAt)
 		}
 		sb.WriteString(` ON CONFLICT (key) DO UPDATE SET
-			blob_id     = EXCLUDED.blob_id,
-			object_id   = EXCLUDED.object_id,
-			patch_id    = EXCLUDED.patch_id,
-			blob_offset = EXCLUDED.blob_offset,
-			size        = EXCLUDED.size,
-			deletable   = EXCLUDED.deletable,
-			end_epoch   = EXCLUDED.end_epoch,
-			expires_at  = EXCLUDED.expires_at,
-			updated_at  = now()`)
+			blob_id      = EXCLUDED.blob_id,
+			object_id    = EXCLUDED.object_id,
+			patch_id     = EXCLUDED.patch_id,
+			blob_offset  = EXCLUDED.blob_offset,
+			size         = EXCLUDED.size,
+			encoded_size = EXCLUDED.encoded_size,
+			cost         = EXCLUDED.cost,
+			deletable    = EXCLUDED.deletable,
+			end_epoch    = EXCLUDED.end_epoch,
+			expires_at   = EXCLUDED.expires_at,
+			updated_at   = now()`)
 
 		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
 			return fmt.Errorf("walrusds: index put-many: %w", err)
@@ -244,18 +265,20 @@ func (p *postgresIndex) PutMany(ctx context.Context, recs []KeyRecord) error {
 }
 
 func (p *postgresIndex) Get(ctx context.Context, key string) (Record, error) {
-	q := fmt.Sprintf(`SELECT blob_id, object_id, patch_id, blob_offset, size, deletable, end_epoch, expires_at FROM %s WHERE key = $1`, p.table)
+	q := fmt.Sprintf(`SELECT blob_id, object_id, patch_id, blob_offset, size, encoded_size, cost, deletable, end_epoch, expires_at FROM %s WHERE key = $1`, p.table)
 	var (
 		rec      Record
+		cost     int64
 		endEpoch int64
 	)
-	err := p.db.QueryRowContext(ctx, q, key).Scan(&rec.BlobID, &rec.ObjectID, &rec.PatchID, &rec.Offset, &rec.Size, &rec.Deletable, &endEpoch, &rec.ExpiresAt)
+	err := p.db.QueryRowContext(ctx, q, key).Scan(&rec.BlobID, &rec.ObjectID, &rec.PatchID, &rec.Offset, &rec.Size, &rec.EncodedSize, &cost, &rec.Deletable, &endEpoch, &rec.ExpiresAt)
 	switch {
 	case err == sql.ErrNoRows:
 		return Record{}, ds.ErrNotFound
 	case err != nil:
 		return Record{}, fmt.Errorf("walrusds: index get %q: %w", key, err)
 	}
+	rec.Cost = uint64(cost)
 	rec.EndEpoch = uint64(endEpoch)
 	return rec, nil
 }
@@ -347,9 +370,9 @@ func (p *postgresIndex) DueForRenewal(ctx context.Context, before time.Time, lim
 // re-upload creates a new Sui Blob object, so newObjectID is recorded too (it
 // is what future in-place extends need). Byte offsets are unchanged (the
 // packfile bytes are identical).
-func (p *postgresIndex) UpdateBlobAfterRenewal(ctx context.Context, oldBlobID, newBlobID, newObjectID string, endEpoch uint64, expiresAt sql.NullTime) error {
-	q := fmt.Sprintf(`UPDATE %s SET blob_id = $2, object_id = $3, end_epoch = $4, expires_at = $5, updated_at = now() WHERE blob_id = $1`, p.table)
-	if _, err := p.db.ExecContext(ctx, q, oldBlobID, newBlobID, newObjectID, int64(endEpoch), expiresAt); err != nil {
+func (p *postgresIndex) UpdateBlobAfterRenewal(ctx context.Context, oldBlobID, newBlobID, newObjectID string, encodedSize int64, cost uint64, endEpoch uint64, expiresAt sql.NullTime) error {
+	q := fmt.Sprintf(`UPDATE %s SET blob_id = $2, object_id = $3, encoded_size = $4, cost = $5, end_epoch = $6, expires_at = $7, updated_at = now() WHERE blob_id = $1`, p.table)
+	if _, err := p.db.ExecContext(ctx, q, oldBlobID, newBlobID, newObjectID, encodedSize, int64(cost), int64(endEpoch), expiresAt); err != nil {
 		return fmt.Errorf("walrusds: updating renewed blob %q: %w", oldBlobID, err)
 	}
 	return nil
