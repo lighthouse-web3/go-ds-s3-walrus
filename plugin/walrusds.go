@@ -25,7 +25,7 @@ func (WalrusPlugin) Name() string {
 }
 
 func (WalrusPlugin) Version() string {
-	return "0.3.0"
+	return "0.4.0"
 }
 
 func (WalrusPlugin) Init(*plugin.Environment) error {
@@ -47,6 +47,8 @@ func (WalrusPlugin) DatastoreTypeName() string {
 // Optional keys:
 //   - "table"                 (string; index table, default "walrus_index")
 //   - "epochs"                (number; storage epochs to buy, default 1)
+//   - "nShards"               (number; Walrus committee shard count for the
+//     encoded-size/datacap fallback, default 1000)
 //   - "deletable"             (bool;   register blobs as deletable)
 //   - "workers"               (number; batch concurrency, default 16)
 //   - "maxOpenConns"          (number; Postgres pool size, default 32)
@@ -104,6 +106,9 @@ func (WalrusPlugin) DatastoreConfigParser() fsrepo.ConfigFromMap {
 		}
 
 		if cfg.Epochs, err = optionalPositiveInt(m, "epochs"); err != nil {
+			return nil, err
+		}
+		if cfg.NShards, err = optionalPositiveInt(m, "nShards"); err != nil {
 			return nil, err
 		}
 	if cfg.Workers, err = optionalPositiveInt(m, "workers"); err != nil {

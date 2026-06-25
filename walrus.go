@@ -89,6 +89,11 @@ type Config struct {
 
 	// Epochs is how many storage epochs new blobs are paid for. Defaults to 1.
 	Epochs int
+	// NShards is the Walrus committee shard count, used only to compute a
+	// blob's encoded ("datacap") size when the publisher response omits it
+	// (e.g. a deduplicated/already-certified blob). Defaults to DefaultNShards
+	// (1000, Walrus mainnet). It does not affect what is stored on Walrus.
+	NShards int
 	// Deletable registers blobs as deletable on Walrus. Defaults to false.
 	Deletable bool
 	// Workers is the Batch.Commit() concurrency. Defaults to defaultWorkers.
@@ -162,6 +167,9 @@ func NewWalrusDatastore(conf Config) (*WalrusDatastore, error) {
 	}
 	if conf.Epochs <= 0 {
 		conf.Epochs = defaultEpochs
+	}
+	if conf.NShards <= 0 {
+		conf.NShards = DefaultNShards
 	}
 	if conf.Workers <= 0 {
 		conf.Workers = defaultWorkers
@@ -240,18 +248,31 @@ func (w *WalrusDatastore) Put(ctx context.Context, k ds.Key, value []byte) error
 	}
 
 	rec := Record{
-		BlobID:    res.BlobID,
-		ObjectID:  res.ObjectID,
-		Offset:    0,
-		Size:      int64(len(value)),
-		Deletable: w.conf.Deletable,
-		EndEpoch:  res.EndEpoch,
-		ExpiresAt: w.expiry(),
+		BlobID:      res.BlobID,
+		ObjectID:    res.ObjectID,
+		Offset:      0,
+		Size:        int64(len(value)),
+		EncodedSize: w.encodedSize(res.EncodedSize, int64(len(value))),
+		Cost:        res.Cost,
+		Deletable:   w.conf.Deletable,
+		EndEpoch:    res.EndEpoch,
+		ExpiresAt:   w.expiry(),
 	}
 	if err := w.index.Put(ctx, k.String(), rec); err != nil {
 		return err
 	}
 	return nil
+}
+
+// encodedSize returns the blob's Walrus encoded ("datacap") size to record.
+// It prefers the value the publisher reported (reported, exact) and falls back
+// to computing it from the unencoded length when the publisher omitted it
+// (e.g. a deduplicated/already-certified blob, whose response carries no size).
+func (w *WalrusDatastore) encodedSize(reported, unencoded int64) int64 {
+	if reported > 0 {
+		return reported
+	}
+	return EncodedBlobLength(unencoded, w.conf.NShards)
 }
 
 func (w *WalrusDatastore) Sync(ctx context.Context, prefix ds.Key) error {
@@ -538,13 +559,15 @@ func (w *WalrusDatastore) storeSingleBlock(ctx context.Context, e blockEntry) er
 		return fmt.Errorf("walrusds: storing block %s: %w", e.key, err)
 	}
 	rec := Record{
-		BlobID:    res.BlobID,
-		ObjectID:  res.ObjectID,
-		Offset:    0,
-		Size:      int64(len(e.val)),
-		Deletable: w.conf.Deletable,
-		EndEpoch:  res.EndEpoch,
-		ExpiresAt: w.expiry(),
+		BlobID:      res.BlobID,
+		ObjectID:    res.ObjectID,
+		Offset:      0,
+		Size:        int64(len(e.val)),
+		EncodedSize: w.encodedSize(res.EncodedSize, int64(len(e.val))),
+		Cost:        res.Cost,
+		Deletable:   w.conf.Deletable,
+		EndEpoch:    res.EndEpoch,
+		ExpiresAt:   w.expiry(),
 	}
 	return w.index.Put(ctx, e.key, rec)
 }
@@ -564,6 +587,11 @@ func (w *WalrusDatastore) storeQuiltPack(ctx context.Context, pack []blockEntry)
 		sizeByID[id] = int64(len(e.val))
 	}
 
+	var totalUnencoded int64
+	for _, e := range pack {
+		totalUnencoded += int64(len(e.val))
+	}
+
 	res, err := w.client.StoreQuilt(ctx, parts, w.conf.Epochs, w.conf.Deletable)
 	if err != nil {
 		return fmt.Errorf("walrusds: storing quilt of %d blocks: %w", len(pack), err)
@@ -571,6 +599,12 @@ func (w *WalrusDatastore) storeQuiltPack(ctx context.Context, pack []blockEntry)
 	if len(res.Patches) != len(pack) {
 		return fmt.Errorf("walrusds: quilt stored %d patches, expected %d", len(res.Patches), len(pack))
 	}
+
+	// The encoded size and cost are quilt-level (one Walrus blob backs every
+	// member); record the same figures on each member row so per-file datacap
+	// is summed over DISTINCT blob_id. The fallback for a deduplicated quilt is
+	// approximate (it ignores the quilt's framing overhead), which is rare.
+	encoded := w.encodedSize(res.EncodedSize, totalUnencoded)
 
 	expiry := w.expiry()
 	recs := make([]KeyRecord, 0, len(res.Patches))
@@ -582,14 +616,16 @@ func (w *WalrusDatastore) storeQuiltPack(ctx context.Context, pack []blockEntry)
 		recs = append(recs, KeyRecord{
 			Key: key,
 			Rec: Record{
-				BlobID:    res.QuiltID,
-				ObjectID:  res.ObjectID,
-				PatchID:   p.QuiltPatchID,
-				Offset:    0,
-				Size:      sizeByID[p.Identifier],
-				Deletable: w.conf.Deletable,
-				EndEpoch:  res.EndEpoch,
-				ExpiresAt: expiry,
+				BlobID:      res.QuiltID,
+				ObjectID:    res.ObjectID,
+				PatchID:     p.QuiltPatchID,
+				Offset:      0,
+				Size:        sizeByID[p.Identifier],
+				EncodedSize: encoded,
+				Cost:        res.Cost,
+				Deletable:   w.conf.Deletable,
+				EndEpoch:    res.EndEpoch,
+				ExpiresAt:   expiry,
 			},
 		})
 	}
@@ -625,10 +661,17 @@ func (w *WalrusDatastore) storeConcatPack(ctx context.Context, pack []blockEntry
 		return fmt.Errorf("walrusds: storing pack of %d blocks: %w", len(pack), err)
 	}
 
+	// One blob backs the whole concat pack: record its encoded size and cost on
+	// every block's row (summed per file over DISTINCT blob_id). total is the
+	// blob's exact unencoded length, so the fallback is exact here too.
+	encoded := w.encodedSize(res.EncodedSize, total)
+
 	expiry := w.expiry()
 	for i := range recs {
 		recs[i].Rec.BlobID = res.BlobID
 		recs[i].Rec.ObjectID = res.ObjectID
+		recs[i].Rec.EncodedSize = encoded
+		recs[i].Rec.Cost = res.Cost
 		recs[i].Rec.Deletable = w.conf.Deletable
 		recs[i].Rec.EndEpoch = res.EndEpoch
 		recs[i].Rec.ExpiresAt = expiry
