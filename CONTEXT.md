@@ -59,17 +59,27 @@ We worked through several options before landing here:
   - Quilts are **immutable** and quilt-level only: `delete`/`extend` can't target a single
     member. `QuiltPatchId` is composition-dependent (not content-addressed), so it changes if a
     block is repacked into a different quilt. Retrieval is one member per request (no bulk read).
-- **`PackTargetSize` is a ceiling, not a floor:** `Commit` flushes whatever is buffered, so a
-  small file uploads immediately as a smaller blob — it never waits to fill. The plugin can only
-  pack what arrives in one `Commit`; we deliberately do **not** coalesce across commits because
-  the datastore contract requires a block to be durable when `Commit` returns (buffering past it
-  would risk data loss on crash). The realized pack size is therefore bounded by Kubo's
-  `Import.BatchMaxSize` (hardcoded ~8 MiB on Kubo <0.33; configurable on v0.33+, divided by
-  `runtime.NumCPU()` in the buffered DAG). To hit 64 MiB packs via `ipfs add`, set
-  `Import.BatchMaxSize ≈ 64 MiB × NumCPU`, `Import.BatchMaxNodes` high, and
-  `Import.UnixFSChunker = size-1048576` (1 MiB). Sweet spot is ~32–64 MiB (diminishing per-blob
-  cost savings vs. rising memory/read-amplification beyond that); Walrus max blob size is
-  13.6 GiB.
+- **Cross-commit staging (v4) — packs now fill regardless of Kubo's commit size.** The old
+  design packed only what arrived in one `Batch.Commit`, and Kubo commits every few MiB (or per
+  small file), so real workloads produced thousands of under-filled blobs — measured live:
+  **1766 blobs at 7.2 blocks/blob avg**, each paying Walrus's fixed **~64 MB per-blob metadata
+  floor** (encoded size ≈ 4.5×raw + ~64 MB/blob ⇒ 4.97 MiB of blocks billed as 9.31 GiB, ~68 MB
+  × 147 blobs for one file). Fix: `Commit`/`Put` no longer upload; they durably write block
+  bytes to a Postgres **staging table** (`<table>_staging`) and return — the durability contract
+  holds because Postgres *is* the durable store. A background **flusher** (`PackFlushInterval`
+  ticker + a kick after every commit) claims staged blocks FIFO once ≥ `PackTargetSize` bytes
+  (or ≤666 for quilts) have accumulated — or once the oldest staged block is older than
+  `PackMaxAge` (default 5 min) — and uploads full packs, up to `Workers` packs in parallel.
+  Claims use a `leased_until` lease (15 min) so multiple nodes sharing the DB never pack the
+  same blocks; a crashed flusher's lease expires and the claim is retried (safe: Walrus uploads
+  are content-addressed/idempotent). `PromoteStaged` then atomically moves rows staging→index,
+  inserting only keys still present in staging so a concurrent `Delete` wins (no resurrection).
+  Reads probe **staging first, then index** (that order can't miss a block mid-promote);
+  `Query`/`List` UNIONs both tables; `Delete` purges both. Oversized blocks
+  (≥ `PackTargetSize`) skip staging and upload directly as plain blobs. Kubo's
+  `Import.BatchMaxSize` no longer matters for pack size (any Kubo version fills 64 MiB packs);
+  1 MiB chunking (`Import.UnixFSChunker=size-1048576`, Kubo v0.40+) still helps by reducing
+  block count. Walrus max blob size is 13.6 GiB; sweet spot for packs remains ~32–64 MiB.
 - **Epoch renewal — per distinct `blob_id`** (so a packed blob / quilt is renewed once, not once
   per block). Two mechanisms and two ways to drive them:
   - **Mechanisms:**
@@ -144,10 +154,10 @@ We worked through several options before landing here:
 
 ```
 go-ds-s3-walrus/
-  walrus.go      # WalrusDatastore: ds.Datastore + ds.Batching; packing in Batch.Commit (package walrusds, at root)
+  walrus.go      # WalrusDatastore: ds.Datastore + ds.Batching; Commit/Put stage to Postgres, background flusher packs staged blocks into full quilts (package walrusds, at root)
   client.go      # context-aware Walrus HTTP client (blob store/read, range read, quilt store + patch read, retries, failover)
   cache.go       # byte-bounded LRU of whole blobs / quilt patches to serve packed reads
-  index.go       # Index interface + postgresIndex (auto-migrate, upsert, put-many, get, delete[-many], list, per-blob renewal; rows carry blob_id + object_id + patch_id)
+  index.go       # Index interface + postgresIndex (auto-migrate, upsert, put-many, get, delete[-many], list, per-blob renewal; rows carry blob_id + object_id + patch_id) + staging table (stage put/get/claim-lease/release/promote)
   renewal.go     # opt-in background epoch-renewal worker + shared renewBlob core (per blob, re-upload)
   client_test.go # quilt multipart streaming tests (length invariant + httptest round-trip)
   plugin/
@@ -173,9 +183,11 @@ Datastore type name registered with Kubo: `walrusds`.
 ## Status
 
 - Implemented and compiling, **now including Walrus Quilt batch packing** (default) with the
-  legacy concat packer behind `disableQuilt`. `go build ./...`, `go vet ./...`, and the plugin
-  config tests pass against the baseline kubo (v0.30.0) and the build also links cleanly when
-  preloaded into newer Kubo (verified against the v0.41.x line via the retarget flow above).
+  legacy concat packer behind `disableQuilt`, **plus cross-commit staging (v4)** so packs
+  actually fill to `PackTargetSize` instead of one under-filled blob per Kubo commit.
+  `go build ./...`, `go vet ./...`, and the tests pass against the baseline kubo (v0.30.0) and
+  the build also links cleanly when preloaded into newer Kubo (verified against the v0.41.x
+  line via the retarget flow above).
 - **Not yet tested live** against a real Walrus endpoint + Postgres (no credentials available
   during development).
 
@@ -201,10 +213,16 @@ Datastore type name registered with Kubo: `walrusds`.
    inside the shared blob; reclaiming space needs a future compaction/GC pass (read live
    blocks, repack, let the old blob expire). Re-upload renewal carries any dead bytes along; the
    `renew.js` *extend* path leaves the blob untouched (so it keeps the same dead weight too).
-6. **Pack sizing** — `packTargetSizeBytes` defaults to 8 MiB to stay under the 10 MiB public
-   limit. Self-hosted publishers/aggregators can raise it; bigger packs amortize cost more but
-   waste more transfer on partial reads (without Range) and carry more dead weight after
-   deletes. Pairs well with raising the IPFS chunk size to 1 MiB.
+6. **Pack sizing** — `packTargetSizeBytes` defaults to 64 MiB (requires a self-hosted
+   publisher/aggregator; public services cap requests near 10 MiB). Bigger packs amortize the
+   ~64 MB per-blob metadata floor further but carry more dead weight after deletes and cost
+   more memory per in-flight upload (`Workers × PackTargetSize`). Pairs well with raising the
+   IPFS chunk size to 1 MiB.
+7. **Staging table operations** — `<table>_staging` churns (insert → claim → delete per block);
+   monitor autovacuum/bloat under heavy ingest. Blocks not yet flushed live only in Postgres
+   (still durable, served from staging on reads) for at most `packMaxAgeSeconds` + one flush;
+   size Postgres accordingly (steady-state staging ≈ ingest rate × PackMaxAge, bounded below by
+   PackTargetSize).
 
 ## How it was split from go-ds-s3
 
