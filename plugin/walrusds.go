@@ -25,7 +25,7 @@ func (WalrusPlugin) Name() string {
 }
 
 func (WalrusPlugin) Version() string {
-	return "0.4.0"
+	return "0.5.0"
 }
 
 func (WalrusPlugin) Init(*plugin.Environment) error {
@@ -55,6 +55,9 @@ func (WalrusPlugin) DatastoreTypeName() string {
 //   - "requestTimeoutSeconds" (number; per-attempt Walrus HTTP timeout)
 //   - "maxRetries"            (number; retries per Walrus request)
 //   - "packTargetSizeBytes"   (number; target packed-blob size, default 64 MiB)
+//   - "packMaxAgeSeconds"     (number; max time a block waits in the Postgres
+//     staging buffer for a pack to fill before flushing anyway, default 300)
+//   - "packFlushIntervalSeconds" (number; staging-buffer check interval, default 15)
 //   - "disableQuilt"          (bool;   pack batches as concatenated blobs instead of quilts)
 //   - "blobCacheBytes"        (number; LRU budget for range reads, default 256 MiB)
 //   - "epochDurationSeconds"  (number; wall-clock length of one epoch; enables renewal)
@@ -126,6 +129,18 @@ func (WalrusPlugin) DatastoreConfigParser() fsrepo.ConfigFromMap {
 			return nil, err
 		}
 		cfg.PackTargetSize = int64(packBytes)
+
+		packAgeSecs, err := optionalPositiveInt(m, "packMaxAgeSeconds")
+		if err != nil {
+			return nil, err
+		}
+		cfg.PackMaxAge = time.Duration(packAgeSecs) * time.Second
+
+		packFlushSecs, err := optionalPositiveInt(m, "packFlushIntervalSeconds")
+		if err != nil {
+			return nil, err
+		}
+		cfg.PackFlushInterval = time.Duration(packFlushSecs) * time.Second
 
 		cacheBytes, err := optionalPositiveInt(m, "blobCacheBytes")
 		if err != nil {

@@ -71,6 +71,26 @@ type RenewItem struct {
 	BlobID string
 }
 
+// StageEntry is one block buffered durably in the Postgres staging table,
+// waiting to be packed into a full-size Walrus quilt. Staging exists because a
+// single Batch.Commit rarely carries enough blocks to fill a pack: without it
+// every commit became its own under-filled Walrus blob, each paying the fixed
+// ~64 MB per-blob metadata overhead. Blocks are durable the moment they are
+// staged (Postgres is the durable index store), so the datastore's commit
+// contract holds while the flusher accumulates a full pack across commits.
+type StageEntry struct {
+	Key   string
+	Value []byte
+}
+
+// StageStats summarizes the claimable (unleased) rows of the staging table so
+// the flusher can decide whether a pack is worth uploading yet.
+type StageStats struct {
+	Count  int64
+	Bytes  int64
+	Oldest sql.NullTime
+}
+
 // Index is the durable key -> blob mapping. It is intentionally an interface
 // so the backend (Postgres today, DynamoDB/SQLite later) can be swapped
 // without touching the datastore logic.
@@ -83,6 +103,28 @@ type Index interface {
 	List(ctx context.Context, prefix string, limit, offset int) ([]ListItem, error)
 	DueForRenewal(ctx context.Context, before time.Time, limit int) ([]RenewItem, error)
 	UpdateBlobAfterRenewal(ctx context.Context, oldBlobID, newBlobID, newObjectID string, encodedSize int64, cost uint64, endEpoch uint64, expiresAt sql.NullTime) error
+
+	// Staging buffer: durable cross-commit accumulation of blocks so the
+	// flusher can build full-size packs. See StageEntry.
+	StagePutMany(ctx context.Context, entries []StageEntry) error
+	StageGet(ctx context.Context, key string) ([]byte, error)
+	StageGetSize(ctx context.Context, key string) (int64, error)
+	StageStats(ctx context.Context) (StageStats, error)
+	// StageClaim leases up to maxCount unleased staged blocks whose cumulative
+	// size stays within maxBytes (always at least one row when any is
+	// claimable), so concurrent flushers on different nodes never build packs
+	// from the same blocks. The lease expires automatically, making a crashed
+	// flusher's claim recoverable; the upload is idempotent (Walrus blob IDs
+	// are content-derived), so a re-claim after a crash is safe.
+	StageClaim(ctx context.Context, maxCount int, maxBytes int64, lease time.Duration) ([]StageEntry, error)
+	// StageRelease returns claimed rows to the claimable pool after a failed
+	// upload so the next flush retries them.
+	StageRelease(ctx context.Context, keys []string) error
+	// PromoteStaged atomically moves blocks from staging to the index: rows are
+	// inserted only for keys still present in staging (a concurrent Delete
+	// wins), and the staged bytes are removed, in one transaction.
+	PromoteStaged(ctx context.Context, recs []KeyRecord) error
+
 	Close() error
 }
 
@@ -92,6 +134,12 @@ type Index interface {
 type postgresIndex struct {
 	db    *sql.DB
 	table string
+}
+
+// stagingTable is the name of the staging buffer table paired with the index
+// table (e.g. walrus_index -> walrus_index_staging).
+func (p *postgresIndex) stagingTable() string {
+	return p.table + "_staging"
 }
 
 // putManyChunk bounds how many rows go into a single multi-row INSERT so we
@@ -173,6 +221,17 @@ func (p *postgresIndex) migrate(ctx context.Context) error {
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_expires_at_idx ON %s (expires_at)`, p.table, p.table),
 		// Renewal groups by blob_id; packed blobs are touched once per blob.
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_blob_id_idx ON %s (blob_id)`, p.table, p.table),
+		// Staging buffer: blocks land here durably at Commit time and are moved
+		// to the index (and Walrus) by the pack flusher. leased_until implements
+		// the claim lease; created_at drives FIFO packing and age-based flushes.
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			key          TEXT PRIMARY KEY,
+			value        BYTEA NOT NULL,
+			size         BIGINT NOT NULL,
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+			leased_until TIMESTAMPTZ
+		)`, p.stagingTable()),
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_created_idx ON %s (created_at)`, p.stagingTable(), p.stagingTable()),
 	}
 	for _, s := range stmts {
 		if _, err := p.db.ExecContext(ctx, s); err != nil {
@@ -218,6 +277,19 @@ func (p *postgresIndex) PutMany(ctx context.Context, recs []KeyRecord) error {
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
 
+	if err := p.putManyTx(ctx, tx, recs); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("walrusds: index put-many commit: %w", err)
+	}
+	return nil
+}
+
+// putManyTx performs PutMany's chunked multi-row upsert inside an existing
+// transaction. It is shared by PutMany and PromoteStaged.
+func (p *postgresIndex) putManyTx(ctx context.Context, tx *sql.Tx, recs []KeyRecord) error {
 	for start := 0; start < len(recs); start += putManyChunk {
 		end := start + putManyChunk
 		if end > len(recs) {
@@ -257,10 +329,6 @@ func (p *postgresIndex) PutMany(ctx context.Context, recs []KeyRecord) error {
 			return fmt.Errorf("walrusds: index put-many: %w", err)
 		}
 	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("walrusds: index put-many commit: %w", err)
-	}
 	return nil
 }
 
@@ -283,34 +351,55 @@ func (p *postgresIndex) Get(ctx context.Context, key string) (Record, error) {
 	return rec, nil
 }
 
+// Delete removes a key from both the index and the staging buffer in one
+// transaction. Deleting the staged row is what makes a concurrent flusher's
+// PromoteStaged a no-op for this key (promotion only inserts rows for keys
+// still staged), so a deleted block cannot be resurrected by an in-flight pack
+// upload.
 func (p *postgresIndex) Delete(ctx context.Context, key string) error {
-	q := fmt.Sprintf(`DELETE FROM %s WHERE key = $1`, p.table)
-	if _, err := p.db.ExecContext(ctx, q, key); err != nil {
-		return fmt.Errorf("walrusds: index delete %q: %w", key, err)
-	}
-	return nil
+	return p.DeleteMany(ctx, []string{key})
 }
 
 func (p *postgresIndex) DeleteMany(ctx context.Context, keys []string) error {
 	if len(keys) == 0 {
 		return nil
 	}
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("walrusds: index delete-many begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
 	q := fmt.Sprintf(`DELETE FROM %s WHERE key = ANY($1)`, p.table)
-	if _, err := p.db.ExecContext(ctx, q, pq.Array(keys)); err != nil {
+	if _, err := tx.ExecContext(ctx, q, pq.Array(keys)); err != nil {
 		return fmt.Errorf("walrusds: index delete-many: %w", err)
+	}
+	q = fmt.Sprintf(`DELETE FROM %s WHERE key = ANY($1)`, p.stagingTable())
+	if _, err := tx.ExecContext(ctx, q, pq.Array(keys)); err != nil {
+		return fmt.Errorf("walrusds: staging delete-many: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("walrusds: index delete-many commit: %w", err)
 	}
 	return nil
 }
 
+// List enumerates keys from the index and the staging buffer together, so
+// blocks that are durably staged but not yet packed onto Walrus are visible to
+// Query (and therefore to GC, refs local, etc.). The UNION dedupes a key that
+// is momentarily in both tables during promotion.
 func (p *postgresIndex) List(ctx context.Context, prefix string, limit, offset int) ([]ListItem, error) {
 	var (
 		q    string
 		args []interface{}
 	)
 	if prefix == "" || prefix == "/" {
-		q = fmt.Sprintf(`SELECT key, size FROM %s ORDER BY key`, p.table)
+		q = fmt.Sprintf(`SELECT key, size FROM %s UNION SELECT key, size FROM %s ORDER BY key`,
+			p.table, p.stagingTable())
 	} else {
-		q = fmt.Sprintf(`SELECT key, size FROM %s WHERE key = $1 OR key LIKE $2 ORDER BY key`, p.table)
+		q = fmt.Sprintf(`SELECT key, size FROM %s WHERE key = $1 OR key LIKE $2
+			UNION SELECT key, size FROM %s WHERE key = $1 OR key LIKE $2 ORDER BY key`,
+			p.table, p.stagingTable())
 		args = append(args, prefix, prefix+"/%")
 	}
 	if limit > 0 {
@@ -374,6 +463,234 @@ func (p *postgresIndex) UpdateBlobAfterRenewal(ctx context.Context, oldBlobID, n
 	q := fmt.Sprintf(`UPDATE %s SET blob_id = $2, object_id = $3, encoded_size = $4, cost = $5, end_epoch = $6, expires_at = $7, updated_at = now() WHERE blob_id = $1`, p.table)
 	if _, err := p.db.ExecContext(ctx, q, oldBlobID, newBlobID, newObjectID, encodedSize, int64(cost), int64(endEpoch), expiresAt); err != nil {
 		return fmt.Errorf("walrusds: updating renewed blob %q: %w", oldBlobID, err)
+	}
+	return nil
+}
+
+// stagePutChunk bounds rows per multi-row staging INSERT (3 bound params per
+// row; the BYTEA values dominate the statement size, not the param count).
+const stagePutChunk = 200
+
+// StagePutMany durably buffers blocks in the staging table in one transaction.
+// Once this commits the datastore's durability contract is satisfied: the
+// bytes live in Postgres until the flusher packs them onto Walrus.
+func (p *postgresIndex) StagePutMany(ctx context.Context, entries []StageEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("walrusds: stage put-many begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	for start := 0; start < len(entries); start += stagePutChunk {
+		end := start + stagePutChunk
+		if end > len(entries) {
+			end = len(entries)
+		}
+		chunk := entries[start:end]
+
+		var (
+			sb   strings.Builder
+			args = make([]interface{}, 0, len(chunk)*3)
+		)
+		sb.WriteString(fmt.Sprintf(`INSERT INTO %s (key, value, size, created_at, leased_until) VALUES `, p.stagingTable()))
+		for i, e := range chunk {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			b := i * 3
+			sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,now(),NULL)", b+1, b+2, b+3))
+			args = append(args, e.Key, e.Value, int64(len(e.Value)))
+		}
+		// A re-put of a staged key refreshes its bytes and clears any lease.
+		// Keys are content-addressed (same key => same bytes), so if the row was
+		// leased by an in-flight pack upload the subsequent promote simply lands
+		// the identical bytes.
+		sb.WriteString(` ON CONFLICT (key) DO UPDATE SET
+			value        = EXCLUDED.value,
+			size         = EXCLUDED.size,
+			created_at   = now(),
+			leased_until = NULL`)
+
+		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
+			return fmt.Errorf("walrusds: stage put-many: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("walrusds: stage put-many commit: %w", err)
+	}
+	return nil
+}
+
+func (p *postgresIndex) StageGet(ctx context.Context, key string) ([]byte, error) {
+	q := fmt.Sprintf(`SELECT value FROM %s WHERE key = $1`, p.stagingTable())
+	var val []byte
+	err := p.db.QueryRowContext(ctx, q, key).Scan(&val)
+	switch {
+	case err == sql.ErrNoRows:
+		return nil, ds.ErrNotFound
+	case err != nil:
+		return nil, fmt.Errorf("walrusds: stage get %q: %w", key, err)
+	}
+	return val, nil
+}
+
+func (p *postgresIndex) StageGetSize(ctx context.Context, key string) (int64, error) {
+	q := fmt.Sprintf(`SELECT size FROM %s WHERE key = $1`, p.stagingTable())
+	var size int64
+	err := p.db.QueryRowContext(ctx, q, key).Scan(&size)
+	switch {
+	case err == sql.ErrNoRows:
+		return -1, ds.ErrNotFound
+	case err != nil:
+		return -1, fmt.Errorf("walrusds: stage get-size %q: %w", key, err)
+	}
+	return size, nil
+}
+
+// StageStats reports the claimable (unleased or lease-expired) staging rows.
+func (p *postgresIndex) StageStats(ctx context.Context) (StageStats, error) {
+	q := fmt.Sprintf(`SELECT count(*), COALESCE(sum(size), 0), min(created_at) FROM %s
+		WHERE leased_until IS NULL OR leased_until < now()`, p.stagingTable())
+	var st StageStats
+	if err := p.db.QueryRowContext(ctx, q).Scan(&st.Count, &st.Bytes, &st.Oldest); err != nil {
+		return StageStats{}, fmt.Errorf("walrusds: stage stats: %w", err)
+	}
+	return st, nil
+}
+
+// StageClaim selects the oldest claimable rows up to maxCount / maxBytes and
+// leases them. Candidate selection and the leasing UPDATE are separate
+// statements, so a row grabbed by a concurrent flusher in between simply drops
+// out of the RETURNING set — both packs stay disjoint.
+func (p *postgresIndex) StageClaim(ctx context.Context, maxCount int, maxBytes int64, lease time.Duration) ([]StageEntry, error) {
+	if maxCount <= 0 || maxBytes <= 0 {
+		return nil, nil
+	}
+
+	q := fmt.Sprintf(`SELECT key, size FROM %s
+		WHERE leased_until IS NULL OR leased_until < now()
+		ORDER BY created_at, key
+		LIMIT $1`, p.stagingTable())
+	rows, err := p.db.QueryContext(ctx, q, maxCount)
+	if err != nil {
+		return nil, fmt.Errorf("walrusds: stage claim select: %w", err)
+	}
+	var (
+		keys  []string
+		total int64
+	)
+	for rows.Next() {
+		var (
+			key  string
+			size int64
+		)
+		if err := rows.Scan(&key, &size); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("walrusds: stage claim scan: %w", err)
+		}
+		// Always take at least one row so a single oversized block still flushes.
+		if len(keys) > 0 && total+size > maxBytes {
+			break
+		}
+		keys = append(keys, key)
+		total += size
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("walrusds: stage claim rows: %w", err)
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	uq := fmt.Sprintf(`UPDATE %s SET leased_until = now() + $2
+		WHERE key = ANY($1) AND (leased_until IS NULL OR leased_until < now())
+		RETURNING key, value`, p.stagingTable())
+	urows, err := p.db.QueryContext(ctx, uq, pq.Array(keys), lease)
+	if err != nil {
+		return nil, fmt.Errorf("walrusds: stage claim lease: %w", err)
+	}
+	defer urows.Close()
+
+	var entries []StageEntry
+	for urows.Next() {
+		var e StageEntry
+		if err := urows.Scan(&e.Key, &e.Value); err != nil {
+			return nil, fmt.Errorf("walrusds: stage claim lease scan: %w", err)
+		}
+		entries = append(entries, e)
+	}
+	return entries, urows.Err()
+}
+
+func (p *postgresIndex) StageRelease(ctx context.Context, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	q := fmt.Sprintf(`UPDATE %s SET leased_until = NULL WHERE key = ANY($1)`, p.stagingTable())
+	if _, err := p.db.ExecContext(ctx, q, pq.Array(keys)); err != nil {
+		return fmt.Errorf("walrusds: stage release: %w", err)
+	}
+	return nil
+}
+
+// PromoteStaged atomically moves a flushed pack from staging into the index:
+// the staged rows are deleted (RETURNING which keys were actually still
+// present) and index rows are inserted only for those survivors. A key deleted
+// concurrently — its staging row already gone — is thereby skipped, so a
+// Delete can never be undone by an in-flight pack upload.
+func (p *postgresIndex) PromoteStaged(ctx context.Context, recs []KeyRecord) error {
+	if len(recs) == 0 {
+		return nil
+	}
+
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("walrusds: promote begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	keys := make([]string, len(recs))
+	for i, kr := range recs {
+		keys[i] = kr.Key
+	}
+	dq := fmt.Sprintf(`DELETE FROM %s WHERE key = ANY($1) RETURNING key`, p.stagingTable())
+	rows, err := tx.QueryContext(ctx, dq, pq.Array(keys))
+	if err != nil {
+		return fmt.Errorf("walrusds: promote delete: %w", err)
+	}
+	survivors := make(map[string]struct{}, len(recs))
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			rows.Close()
+			return fmt.Errorf("walrusds: promote scan: %w", err)
+		}
+		survivors[k] = struct{}{}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("walrusds: promote rows: %w", err)
+	}
+
+	live := make([]KeyRecord, 0, len(recs))
+	for _, kr := range recs {
+		if _, ok := survivors[kr.Key]; ok {
+			live = append(live, kr)
+		}
+	}
+	if len(live) > 0 {
+		if err := p.putManyTx(ctx, tx, live); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("walrusds: promote commit: %w", err)
 	}
 	return nil
 }

@@ -49,15 +49,36 @@ CREATE TABLE walrus_index (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- plus the staging buffer (see "Cross-commit staging" below):
+CREATE TABLE walrus_index_staging (
+  key          TEXT PRIMARY KEY,
+  value        BYTEA NOT NULL,     -- block bytes awaiting packing
+  size         BIGINT NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  leased_until TIMESTAMPTZ         -- flusher claim lease (multi-node safety)
+);
 ```
 
-**Block packing (Walrus Quilt).** To amortize Walrus's per-blob cost (Sui gas + WAL minimums +
-erasure-coding overhead), `Batch.Commit` groups many IPFS blocks (up to `packTargetSizeBytes`,
-default 64 MiB, and at most 666 blocks) and stores each group as a single Walrus
+**Block packing (Walrus Quilt).** Walrus bills by *encoded* size: ~4.5× the raw bytes **plus a
+fixed ~64 MB of per-blob metadata** — so every under-filled blob costs ~68 MB minimum no matter
+how little data it holds. To amortize that, the plugin packs many IPFS blocks (up to
+`packTargetSizeBytes`, default 64 MiB, and at most 666 blocks) into a single Walrus
 [**quilt**](https://docs.wal.app/docs/system-overview/quilt) — Walrus's native batch-storage
 primitive, which can cut small-blob storage cost by >400x. Each `key` row records `blob_id` (the
 quilt's own blob ID) and `patch_id` (its `QuiltPatchID`); `Get` reads just that member via the
 aggregator's `by-quilt-patch-id` endpoint, so only the requested block transfers.
+
+**Cross-commit staging (how packs fill).** A single Kubo `Batch.Commit` rarely carries anywhere
+near 64 MiB, so uploading per commit would create one under-filled (~68 MB-billed) blob per
+commit. Instead, `Put`/`Commit` write block bytes durably to a Postgres **staging table**
+(`<table>_staging`, created automatically) and return immediately — durability holds because
+Postgres is the durable store. A background flusher packs staged blocks FIFO into full-size
+quilts once `packTargetSizeBytes` has accumulated, or after `packMaxAgeSeconds` (default 300) so
+blocks never wait indefinitely, uploading up to `workers` packs in parallel. Staged-but-unflushed
+blocks are fully readable (served from Postgres) and deletable; claims are leased so multiple
+nodes sharing the database never pack the same blocks twice. Kubo's `Import.BatchMaxSize` no
+longer limits pack size.
 
 Set `disableQuilt: true` to fall back to the **legacy concat scheme** instead: blocks are
 concatenated into one opaque blob and addressed by `blob_offset`/`size`, read back via HTTP
@@ -68,14 +89,11 @@ it is `''` for legacy rows and for already-certified uploads. Existing repos
 upgrade transparently: the `object_id`/`patch_id`/`blob_offset` columns default to `''`/`''`/`0`, so legacy rows
 keep working unchanged.
 
-`packTargetSizeBytes` is a **ceiling, not a floor** — a small file uploads immediately as a
-smaller blob and never waits to fill. The plugin can only pack the blocks delivered in one
-`Batch.Commit`, which Kubo bounds by `Import.BatchMaxSize` (default ~8 MiB on Kubo <0.33;
-configurable on v0.33+, where it is additionally divided by `runtime.NumCPU()`). To get large
-packs, set `Import.BatchMaxSize ≈ packTargetSizeBytes × NumCPU` and raise `Import.BatchMaxNodes`.
 Pairs well with raising the IPFS chunk size to 1 MiB (the max interoperable block size; clean on
-Kubo v0.40+). Measure the realized ratio with
-`SELECT count(*), count(DISTINCT blob_id) FROM walrus_index;`.
+Kubo v0.40+), which cuts block count per file. Measure the realized packing ratio with
+`SELECT count(*), count(DISTINCT blob_id) FROM walrus_index;` — healthy ingest should show
+hundreds of blocks per blob, and per-blob billed size can be checked via
+`SELECT count(*), encoded_size FROM walrus_index GROUP BY blob_id, encoded_size`.
 
 ## Building and Installing
 
@@ -246,9 +264,11 @@ Notes:
 | `table` | no | `walrus_index` | Index table name. |
 | `epochs` | no | `1` | Storage epochs to purchase per blob. **Set this high** (see below). |
 | `deletable` | no | `false` | Register blobs as deletable on Walrus. |
-| `workers` | no | `16` | Concurrency for `Batch().Commit()` (packfile uploads run in parallel). Peak upload memory ≈ `workers × packTargetSizeBytes`, so raise this together with host RAM (and `maxOpenConns`). |
+| `workers` | no | `16` | How many packs the background flusher uploads to Walrus in parallel. Peak upload memory ≈ `workers × packTargetSizeBytes`, so raise this together with host RAM (and `maxOpenConns`). |
 | `maxOpenConns` | no | `32` | Upper bound on the Postgres connection pool. Keep it ≥ `workers` so committing packs does not starve on connections; an unbounded pool can exhaust Postgres' `max_connections`. |
-| `packTargetSizeBytes` | no | `67108864` (64 MiB) | **Ceiling** for a packed Walrus blob: blocks in one `Batch.Commit` are grouped up to this size (and ≤666 blocks) and stored as one quilt (a smaller commit uploads immediately — it never waits to fill). Packs >10 MiB require a self-hosted publisher/aggregator (public services cap requests near 10 MiB). The realized pack size is also bounded by Kubo's `Import.BatchMaxSize` (see below). |
+| `packTargetSizeBytes` | no | `67108864` (64 MiB) | Target size of a packed Walrus blob. Blocks are staged durably in Postgres across commits and flushed as one quilt (≤666 blocks) once this many bytes accumulate, so packs actually fill regardless of Kubo's commit size. Packs >10 MiB require a self-hosted publisher/aggregator (public services cap requests near 10 MiB). |
+| `packMaxAgeSeconds` | no | `300` | Longest a block waits in the Postgres staging buffer for a pack to fill before being flushed to Walrus anyway. Staged blocks are already durable and readable; this only bounds how long they are served from Postgres instead of Walrus. |
+| `packFlushIntervalSeconds` | no | `15` | How often the flusher re-checks the staging buffer (it is also kicked immediately after every commit). |
 | `disableQuilt` | no | `false` | When `true`, pack batches as legacy concatenated blobs (read by byte range) instead of Walrus quilts. Existing rows of either kind keep working regardless. |
 | `blobCacheBytes` | no | `268435456` (256 MiB) | In-memory LRU budget for whole blobs, used to serve range reads of packed blocks. Per-entry cap is ¼ of this, so the default keeps a 64 MiB pack cacheable. A negative value disables the cache. |
 | `requestTimeoutSeconds` | no | `60` | Per-attempt Walrus HTTP timeout. |

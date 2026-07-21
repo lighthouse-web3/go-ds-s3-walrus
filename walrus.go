@@ -20,6 +20,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,7 +31,7 @@ import (
 )
 
 const (
-	// defaultWorkers is the Batch.Commit() upload concurrency. Each in-flight
+	// defaultWorkers is the pack flusher's upload concurrency. Each in-flight
 	// pack holds its bytes in memory while uploading, so peak memory scales
 	// with workers × PackTargetSize; 16 keeps that bounded (≈1 GiB at the 64
 	// MiB default) while still saturating a self-hosted publisher. Raise it
@@ -65,6 +66,23 @@ const (
 	// A pack destined to become a quilt may therefore hold at most this many
 	// blocks regardless of PackTargetSize.
 	quiltMaxPatches = 666
+	// concatMaxBlocks bounds a claimed concat pack (DisableQuilt) so a single
+	// flush cannot build an unboundedly long index transaction. There is no
+	// protocol limit for concat packs; PackTargetSize is the real bound.
+	concatMaxBlocks = 10000
+	// defaultPackMaxAge is how long a block may sit in the Postgres staging
+	// buffer before it is flushed to Walrus even though a full pack has not
+	// accumulated. Staged blocks are already durable (Postgres), so this only
+	// bounds how long bytes are served from Postgres instead of Walrus.
+	defaultPackMaxAge = 5 * time.Minute
+	// defaultPackFlushInterval is how often the flusher re-checks the staging
+	// buffer, independently of the kicks it gets after every Commit.
+	defaultPackFlushInterval = 15 * time.Second
+	// stageLease is how long a flusher's claim on staged rows lasts. It must
+	// comfortably exceed the worst-case pack upload (RequestTimeout × retries
+	// × publishers); an expired lease simply lets another flusher retry, which
+	// is safe because Walrus uploads are content-addressed (idempotent).
+	stageLease = 15 * time.Minute
 )
 
 var (
@@ -96,9 +114,10 @@ type Config struct {
 	NShards int
 	// Deletable registers blobs as deletable on Walrus. Defaults to false.
 	Deletable bool
-	// Workers is the Batch.Commit() concurrency. Defaults to defaultWorkers.
-	// Peak upload memory is roughly Workers × PackTargetSize, so raise both
-	// Workers and host RAM together.
+	// Workers is how many packs the flusher uploads to Walrus in parallel when
+	// the staging buffer holds more than one pack's worth of blocks. Defaults
+	// to defaultWorkers. Peak upload memory is roughly Workers ×
+	// PackTargetSize, so raise both Workers and host RAM together.
 	Workers int
 	// MaxOpenConns bounds the Postgres connection pool. Defaults to
 	// defaultMaxOpenConns. Keep it >= Workers so committing packs does not
@@ -118,6 +137,16 @@ type Config struct {
 	// natively and are read back per-member by QuiltPatchID. Existing rows
 	// written under either scheme keep working regardless of this setting.
 	DisableQuilt bool
+	// PackMaxAge bounds how long a block may wait in the Postgres staging
+	// buffer for a pack to fill before it is flushed to Walrus anyway.
+	// Blocks are durable from the moment they are staged; this only trades
+	// slightly longer Postgres-served reads for fuller (cheaper) packs.
+	// Defaults to defaultPackMaxAge.
+	PackMaxAge time.Duration
+	// PackFlushInterval is how often the background flusher checks the staging
+	// buffer (it is additionally kicked after every Commit). Defaults to
+	// defaultPackFlushInterval.
+	PackFlushInterval time.Duration
 	// BlobCacheBytes is the byte budget for the in-memory LRU of whole blobs
 	// used to serve range reads of packed blocks. Defaults to
 	// defaultBlobCacheBytes; a negative value disables the cache.
@@ -147,6 +176,11 @@ type WalrusDatastore struct {
 	conf   Config
 	client *Client
 	index  Index
+
+	// flushKick nudges the pack flusher right after a Commit stages new
+	// blocks, so full packs upload immediately instead of waiting for the
+	// next ticker interval.
+	flushKick chan struct{}
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -186,6 +220,12 @@ func NewWalrusDatastore(conf Config) (*WalrusDatastore, error) {
 	if conf.PackTargetSize <= 0 {
 		conf.PackTargetSize = defaultPackTargetSize
 	}
+	if conf.PackMaxAge <= 0 {
+		conf.PackMaxAge = defaultPackMaxAge
+	}
+	if conf.PackFlushInterval <= 0 {
+		conf.PackFlushInterval = defaultPackFlushInterval
+	}
 	// A negative BlobCacheBytes explicitly disables caching; zero means default.
 	cacheBytes := conf.BlobCacheBytes
 	switch {
@@ -212,11 +252,14 @@ func NewWalrusDatastore(conf Config) (*WalrusDatastore, error) {
 	})
 
 	w := &WalrusDatastore{
-		conf:   conf,
-		client: client,
-		index:  index,
-		cancel: cancel,
+		conf:      conf,
+		client:    client,
+		index:     index,
+		flushKick: make(chan struct{}, 1),
+		cancel:    cancel,
 	}
+
+	w.startFlushWorker(ctx)
 
 	if conf.RenewInterval > 0 && conf.EpochDuration > 0 {
 		w.startRenewalWorker(ctx)
@@ -237,30 +280,24 @@ func (w *WalrusDatastore) expiry() sql.NullTime {
 	}
 }
 
-// Put uploads value to Walrus and records the resulting blob ID and metadata
-// in Postgres. The Walrus upload happens first: if the index write then
-// fails, the blob exists but is unreferenced (a recoverable leak), which is
-// strictly safer than an index row pointing at a blob that was never stored.
+// Put durably stages value in Postgres and returns; the background flusher
+// packs staged blocks from many Puts/Commits into full-size Walrus blobs.
+// Staging is what lets packs fill across commits: uploading synchronously per
+// Put/Commit produced one under-filled blob per commit, each paying Walrus's
+// fixed ~64 MB per-blob metadata overhead. A value too large to ever share a
+// pack skips staging and goes straight to Walrus as its own blob.
 func (w *WalrusDatastore) Put(ctx context.Context, k ds.Key, value []byte) error {
-	res, err := w.client.Store(ctx, value, w.conf.Epochs, w.conf.Deletable)
-	if err != nil {
-		return fmt.Errorf("walrusds: storing %s: %w", k.String(), err)
+	if int64(len(value)) >= w.conf.PackTargetSize {
+		recs, err := w.uploadPack(ctx, []blockEntry{{key: k.String(), val: value}})
+		if err != nil {
+			return err
+		}
+		return w.index.PutMany(ctx, recs)
 	}
-
-	rec := Record{
-		BlobID:      res.BlobID,
-		ObjectID:    res.ObjectID,
-		Offset:      0,
-		Size:        int64(len(value)),
-		EncodedSize: w.encodedSize(res.EncodedSize, int64(len(value))),
-		Cost:        res.Cost,
-		Deletable:   w.conf.Deletable,
-		EndEpoch:    res.EndEpoch,
-		ExpiresAt:   w.expiry(),
-	}
-	if err := w.index.Put(ctx, k.String(), rec); err != nil {
+	if err := w.index.StagePutMany(ctx, []StageEntry{{Key: k.String(), Value: value}}); err != nil {
 		return err
 	}
+	w.kickFlusher()
 	return nil
 }
 
@@ -279,9 +316,21 @@ func (w *WalrusDatastore) Sync(ctx context.Context, prefix ds.Key) error {
 	return nil
 }
 
-// Get resolves the blob ID for k in Postgres and fetches the bytes from the
-// Walrus aggregator. Returns ds.ErrNotFound when k is unknown to the index.
+// Get serves k from the Postgres staging buffer if it has not been packed
+// onto Walrus yet; otherwise it resolves the blob ID in Postgres and fetches
+// the bytes from the Walrus aggregator. Returns ds.ErrNotFound when k is
+// unknown.
+//
+// Staging is checked first deliberately: promotion moves a key atomically
+// from staging to the index, so probing in that order can never miss a block
+// mid-promote (the reverse order could miss both sides of the move).
 func (w *WalrusDatastore) Get(ctx context.Context, k ds.Key) ([]byte, error) {
+	if val, err := w.index.StageGet(ctx, k.String()); err == nil {
+		return val, nil
+	} else if err != ds.ErrNotFound {
+		return nil, err
+	}
+
 	rec, err := w.index.Get(ctx, k.String())
 	if err != nil {
 		return nil, err
@@ -304,9 +353,20 @@ func (w *WalrusDatastore) Get(ctx context.Context, k ds.Key) ([]byte, error) {
 	return data, nil
 }
 
-// Has reports whether k is present, answered entirely from Postgres.
+// Has reports whether k is present (staged or indexed), answered entirely
+// from Postgres. Staging is probed first for the same mid-promote reason as
+// Get.
 func (w *WalrusDatastore) Has(ctx context.Context, k ds.Key) (bool, error) {
-	_, err := w.index.Get(ctx, k.String())
+	_, err := w.index.StageGetSize(ctx, k.String())
+	switch err {
+	case nil:
+		return true, nil
+	case ds.ErrNotFound:
+	default:
+		return false, err
+	}
+
+	_, err = w.index.Get(ctx, k.String())
 	switch err {
 	case nil:
 		return true, nil
@@ -319,6 +379,12 @@ func (w *WalrusDatastore) Has(ctx context.Context, k ds.Key) (bool, error) {
 
 // GetSize returns the stored size for k, answered entirely from Postgres.
 func (w *WalrusDatastore) GetSize(ctx context.Context, k ds.Key) (int, error) {
+	if sz, err := w.index.StageGetSize(ctx, k.String()); err == nil {
+		return int(sz), nil
+	} else if err != ds.ErrNotFound {
+		return -1, err
+	}
+
 	rec, err := w.index.Get(ctx, k.String())
 	if err != nil {
 		return -1, err
@@ -326,10 +392,11 @@ func (w *WalrusDatastore) GetSize(ctx context.Context, k ds.Key) (int, error) {
 	return int(rec.Size), nil
 }
 
-// Delete removes the index entry for k. It does not delete the underlying
-// Walrus blob: on-chain deletion requires a Sui key and is out of scope for
-// this datastore. The blob becomes unreferenced and eventually expires.
-// Delete is idempotent.
+// Delete removes k from the index and from the staging buffer (so an
+// in-flight pack upload cannot resurrect it). It does not delete the
+// underlying Walrus blob: on-chain deletion requires a Sui key and is out of
+// scope for this datastore. The blob becomes unreferenced and eventually
+// expires. Delete is idempotent.
 func (w *WalrusDatastore) Delete(ctx context.Context, k ds.Key) error {
 	return w.index.Delete(ctx, k.String())
 }
@@ -377,9 +444,8 @@ func (w *WalrusDatastore) Query(ctx context.Context, q dsq.Query) (dsq.Results, 
 // Batch buffers Put/Delete operations and applies them concurrently on Commit.
 func (w *WalrusDatastore) Batch(_ context.Context) (ds.Batch, error) {
 	return &walrusBatch{
-		w:          w,
-		ops:        make(map[string]batchOp),
-		numWorkers: w.conf.Workers,
+		w:   w,
+		ops: make(map[string]batchOp),
 	}, nil
 }
 
@@ -402,9 +468,8 @@ func normalizePrefix(prefix string) string {
 }
 
 type walrusBatch struct {
-	w          *WalrusDatastore
-	ops        map[string]batchOp
-	numWorkers int
+	w   *WalrusDatastore
+	ops map[string]batchOp
 }
 
 type batchOp struct {
@@ -428,155 +493,235 @@ type blockEntry struct {
 	val []byte
 }
 
-// Commit groups the buffered Puts into packed Walrus blobs (concatenating
-// blocks up to PackTargetSize and uploading each pack as a single blob), then
-// applies the buffered Deletes. Packs are uploaded concurrently; each pack
-// keeps the Walrus-first ordering invariant: the blob is stored before its
-// index rows are written, so a failure leaks a recoverable blob rather than
-// leaving a dangling index row.
+// Commit durably stages the buffered Puts in Postgres and applies the
+// buffered Deletes, then nudges the pack flusher. Blocks are NOT uploaded to
+// Walrus here: a single Commit rarely carries enough bytes to fill a pack
+// (Kubo's importer commits every few MiB), and uploading per commit is what
+// produced thousands of under-filled blobs each paying Walrus's fixed ~64 MB
+// per-blob metadata overhead. Durability is preserved — the staging table is
+// in the same Postgres that already holds the index — while the flusher
+// accumulates staged blocks across commits into full PackTargetSize packs.
+// Only a block too large to ever share a pack is uploaded directly.
 func (b *walrusBatch) Commit(ctx context.Context) error {
 	var (
-		puts    []blockEntry
-		deletes []string
+		stage    []StageEntry
+		oversize []blockEntry
+		deletes  []string
 	)
 	for key, op := range b.ops {
-		if op.isDelete {
+		switch {
+		case op.isDelete:
 			deletes = append(deletes, key)
-		} else {
-			puts = append(puts, blockEntry{key: key, val: op.val})
+		case int64(len(op.val)) >= b.w.conf.PackTargetSize:
+			oversize = append(oversize, blockEntry{key: key, val: op.val})
+		default:
+			stage = append(stage, StageEntry{Key: key, Value: op.val})
 		}
 	}
 
-	maxPerPack := 0
-	if !b.w.conf.DisableQuilt {
-		maxPerPack = quiltMaxPatches
+	var errs []string
+	if err := b.w.index.StagePutMany(ctx, stage); err != nil {
+		errs = append(errs, err.Error())
 	}
-	packs := buildPacks(puts, b.w.conf.PackTargetSize, maxPerPack)
-
-	jobs := make([]func() error, 0, len(packs)+1)
-	for _, pack := range packs {
-		pack := pack
-		jobs = append(jobs, func() error { return b.w.storePack(ctx, pack) })
+	for _, e := range oversize {
+		recs, err := b.w.uploadPack(ctx, []blockEntry{e})
+		if err == nil {
+			err = b.w.index.PutMany(ctx, recs)
+		}
+		if err != nil {
+			errs = append(errs, err.Error())
+		}
 	}
 	if len(deletes) > 0 {
-		jobs = append(jobs, func() error { return b.w.index.DeleteMany(ctx, deletes) })
-	}
-	if len(jobs) == 0 {
-		return nil
-	}
-
-	numWorkers := b.numWorkers
-	if numWorkers <= 0 {
-		numWorkers = defaultWorkers
-	}
-	if len(jobs) < numWorkers {
-		numWorkers = len(jobs)
-	}
-
-	jobCh := make(chan func() error, len(jobs))
-	results := make(chan error, len(jobs))
-	var wg sync.WaitGroup
-	wg.Add(numWorkers)
-	for i := 0; i < numWorkers; i++ {
-		go func() {
-			defer wg.Done()
-			for j := range jobCh {
-				results <- j()
-			}
-		}()
-	}
-	for _, j := range jobs {
-		jobCh <- j
-	}
-	close(jobCh)
-	wg.Wait()
-	close(results)
-
-	var errs []string
-	for err := range results {
-		if err != nil {
+		if err := b.w.index.DeleteMany(ctx, deletes); err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf("walrusds: failed batch operation:\n%s", strings.Join(errs, "\n"))
 	}
+
+	if len(stage) > 0 {
+		b.w.kickFlusher()
+	}
 	return nil
 }
 
-// buildPacks greedily groups blocks into packs no larger than target bytes and,
-// when maxCount > 0, no more than maxCount blocks each (the quilt member limit).
-// A single block bigger than target gets its own pack (it cannot be split).
-func buildPacks(puts []blockEntry, target int64, maxCount int) [][]blockEntry {
-	if target <= 0 {
-		target = defaultPackTargetSize
+// kickFlusher nudges the pack flusher without blocking; a full channel means
+// a check is already pending, which is just as good.
+func (w *WalrusDatastore) kickFlusher() {
+	select {
+	case w.flushKick <- struct{}{}:
+	default:
 	}
-	var (
-		packs   [][]blockEntry
-		cur     []blockEntry
-		curSize int64
-	)
-	for _, e := range puts {
-		sz := int64(len(e.val))
-		overSize := curSize+sz > target
-		overCount := maxCount > 0 && len(cur) >= maxCount
-		if len(cur) > 0 && (overSize || overCount) {
-			packs = append(packs, cur)
-			cur = nil
-			curSize = 0
-		}
-		cur = append(cur, e)
-		curSize += sz
-	}
-	if len(cur) > 0 {
-		packs = append(packs, cur)
-	}
-	return packs
 }
 
-// storePack persists one pack of blocks, keeping the Walrus-first ordering
-// invariant (blob stored before index rows). A single-block pack is stored as
-// a plain blob; a multi-block pack is stored as a Walrus quilt unless quilting
-// is disabled, in which case it falls back to the legacy concatenated blob.
-func (w *WalrusDatastore) storePack(ctx context.Context, pack []blockEntry) error {
+// startFlushWorker launches the background goroutine that turns staged blocks
+// into full-size Walrus packs. It runs on every node sharing the index; the
+// staging claim lease keeps concurrent flushers from packing the same blocks,
+// and a crashed flusher's lease simply expires (re-uploading is idempotent:
+// Walrus blob IDs are content-derived).
+func (w *WalrusDatastore) startFlushWorker(ctx context.Context) {
+	w.wg.Add(1)
+	go func() {
+		defer w.wg.Done()
+		ticker := time.NewTicker(w.conf.PackFlushInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				w.flushStaged(ctx)
+			case <-w.flushKick:
+				w.flushStaged(ctx)
+			}
+		}
+	}()
+}
+
+// flushStaged uploads staged blocks as packs while a pack is "ripe": either a
+// full PackTargetSize of bytes has accumulated, or the oldest staged block
+// has waited PackMaxAge (so data reaches Walrus promptly even on quiet
+// nodes). It claims up to Workers packs at a time (leasing them against
+// concurrent flushers) and uploads them in parallel; each pack is then
+// atomically moved from staging to the index. On upload failure the claim is
+// released for a later retry — the blocks stay durable in staging throughout.
+// Peak memory is bounded by Workers × PackTargetSize.
+func (w *WalrusDatastore) flushStaged(ctx context.Context) {
+	maxCount := quiltMaxPatches
+	if w.conf.DisableQuilt {
+		maxCount = concatMaxBlocks
+	}
+
+	for {
+		var packs [][]StageEntry
+		for len(packs) < w.conf.Workers {
+			st, err := w.index.StageStats(ctx)
+			if err != nil {
+				log.Printf("walrusds: staging stats failed: %v", err)
+				break
+			}
+			if st.Count == 0 {
+				break
+			}
+			aged := st.Oldest.Valid && time.Since(st.Oldest.Time) >= w.conf.PackMaxAge
+			if st.Bytes < w.conf.PackTargetSize && !aged {
+				break
+			}
+
+			entries, err := w.index.StageClaim(ctx, maxCount, w.conf.PackTargetSize, stageLease)
+			if err != nil {
+				log.Printf("walrusds: staging claim failed: %v", err)
+				break
+			}
+			if len(entries) == 0 {
+				break
+			}
+			packs = append(packs, entries)
+		}
+		if len(packs) == 0 {
+			return
+		}
+
+		var (
+			wg     sync.WaitGroup
+			failed bool
+			mu     sync.Mutex
+		)
+		for _, entries := range packs {
+			entries := entries
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := w.flushOnePack(ctx, entries); err != nil {
+					log.Printf("walrusds: %v", err)
+					mu.Lock()
+					failed = true
+					mu.Unlock()
+				}
+			}()
+		}
+		wg.Wait()
+		if failed {
+			// Back off until the next tick/kick instead of hot-looping on a
+			// failing publisher; the released claims retry then.
+			return
+		}
+	}
+}
+
+// flushOnePack uploads one claimed pack and promotes its members from staging
+// to the index, releasing the claim on failure.
+func (w *WalrusDatastore) flushOnePack(ctx context.Context, entries []StageEntry) error {
+	pack := make([]blockEntry, len(entries))
+	keys := make([]string, len(entries))
+	for i, e := range entries {
+		pack[i] = blockEntry{key: e.Key, val: e.Value}
+		keys[i] = e.Key
+	}
+
+	recs, err := w.uploadPack(ctx, pack)
+	if err == nil {
+		err = w.index.PromoteStaged(ctx, recs)
+	}
+	if err != nil {
+		if rerr := w.index.StageRelease(ctx, keys); rerr != nil {
+			log.Printf("walrusds: releasing %d staged blocks failed: %v", len(keys), rerr)
+		}
+		return fmt.Errorf("flushing pack of %d blocks: %w", len(pack), err)
+	}
+	return nil
+}
+
+// uploadPack stores one pack of blocks on Walrus and returns the index rows
+// to persist, keeping the Walrus-first ordering invariant (blob stored before
+// index rows, so a failure leaks a recoverable blob rather than leaving a
+// dangling row). A single-block pack is stored as a plain blob; a multi-block
+// pack as a Walrus quilt, or as a legacy concatenated blob when DisableQuilt
+// is set.
+func (w *WalrusDatastore) uploadPack(ctx context.Context, pack []blockEntry) ([]KeyRecord, error) {
 	switch {
 	case len(pack) == 0:
-		return nil
+		return nil, nil
 	case len(pack) == 1:
-		return w.storeSingleBlock(ctx, pack[0])
+		return w.uploadSingleBlock(ctx, pack[0])
 	case w.conf.DisableQuilt:
-		return w.storeConcatPack(ctx, pack)
+		return w.uploadConcatPack(ctx, pack)
 	default:
-		return w.storeQuiltPack(ctx, pack)
+		return w.uploadQuiltPack(ctx, pack)
 	}
 }
 
-// storeSingleBlock stores one block as its own Walrus blob (a quilt of one is
-// not worthwhile). The row has an empty PatchID and Offset 0.
-func (w *WalrusDatastore) storeSingleBlock(ctx context.Context, e blockEntry) error {
+// uploadSingleBlock stores one block as its own Walrus blob (a quilt of one
+// is not worthwhile). The row has an empty PatchID and Offset 0.
+func (w *WalrusDatastore) uploadSingleBlock(ctx context.Context, e blockEntry) ([]KeyRecord, error) {
 	res, err := w.client.Store(ctx, e.val, w.conf.Epochs, w.conf.Deletable)
 	if err != nil {
-		return fmt.Errorf("walrusds: storing block %s: %w", e.key, err)
+		return nil, fmt.Errorf("walrusds: storing block %s: %w", e.key, err)
 	}
-	rec := Record{
-		BlobID:      res.BlobID,
-		ObjectID:    res.ObjectID,
-		Offset:      0,
-		Size:        int64(len(e.val)),
-		EncodedSize: w.encodedSize(res.EncodedSize, int64(len(e.val))),
-		Cost:        res.Cost,
-		Deletable:   w.conf.Deletable,
-		EndEpoch:    res.EndEpoch,
-		ExpiresAt:   w.expiry(),
-	}
-	return w.index.Put(ctx, e.key, rec)
+	return []KeyRecord{{
+		Key: e.key,
+		Rec: Record{
+			BlobID:      res.BlobID,
+			ObjectID:    res.ObjectID,
+			Offset:      0,
+			Size:        int64(len(e.val)),
+			EncodedSize: w.encodedSize(res.EncodedSize, int64(len(e.val))),
+			Cost:        res.Cost,
+			Deletable:   w.conf.Deletable,
+			EndEpoch:    res.EndEpoch,
+			ExpiresAt:   w.expiry(),
+		},
+	}}, nil
 }
 
-// storeQuiltPack stores a pack of blocks as a single Walrus quilt and records
-// each member's QuiltPatchID in the index in one transaction. Member
-// identifiers are the block's position in the pack, which the store response
-// echoes back so we can map each returned patch ID to its key.
-func (w *WalrusDatastore) storeQuiltPack(ctx context.Context, pack []blockEntry) error {
+// uploadQuiltPack stores a pack of blocks as a single Walrus quilt and
+// returns each member's row with its QuiltPatchID. Member identifiers are the
+// block's position in the pack, which the store response echoes back so we
+// can map each returned patch ID to its key.
+func (w *WalrusDatastore) uploadQuiltPack(ctx context.Context, pack []blockEntry) ([]KeyRecord, error) {
 	parts := make([]QuiltPart, len(pack))
 	keyByID := make(map[string]string, len(pack))
 	sizeByID := make(map[string]int64, len(pack))
@@ -594,10 +739,10 @@ func (w *WalrusDatastore) storeQuiltPack(ctx context.Context, pack []blockEntry)
 
 	res, err := w.client.StoreQuilt(ctx, parts, w.conf.Epochs, w.conf.Deletable)
 	if err != nil {
-		return fmt.Errorf("walrusds: storing quilt of %d blocks: %w", len(pack), err)
+		return nil, fmt.Errorf("walrusds: storing quilt of %d blocks: %w", len(pack), err)
 	}
 	if len(res.Patches) != len(pack) {
-		return fmt.Errorf("walrusds: quilt stored %d patches, expected %d", len(res.Patches), len(pack))
+		return nil, fmt.Errorf("walrusds: quilt stored %d patches, expected %d", len(res.Patches), len(pack))
 	}
 
 	// The encoded size and cost are quilt-level (one Walrus blob backs every
@@ -611,7 +756,7 @@ func (w *WalrusDatastore) storeQuiltPack(ctx context.Context, pack []blockEntry)
 	for _, p := range res.Patches {
 		key, ok := keyByID[p.Identifier]
 		if !ok {
-			return fmt.Errorf("walrusds: quilt returned unknown identifier %q", p.Identifier)
+			return nil, fmt.Errorf("walrusds: quilt returned unknown identifier %q", p.Identifier)
 		}
 		recs = append(recs, KeyRecord{
 			Key: key,
@@ -629,13 +774,13 @@ func (w *WalrusDatastore) storeQuiltPack(ctx context.Context, pack []blockEntry)
 			},
 		})
 	}
-	return w.index.PutMany(ctx, recs)
+	return recs, nil
 }
 
-// storeConcatPack is the legacy packing scheme: concatenate the pack's blocks
-// into one blob, upload it, and record each block's byte range. Used only when
-// DisableQuilt is set.
-func (w *WalrusDatastore) storeConcatPack(ctx context.Context, pack []blockEntry) error {
+// uploadConcatPack is the legacy packing scheme: concatenate the pack's
+// blocks into one blob, upload it, and return each block's byte-range row.
+// Used only when DisableQuilt is set.
+func (w *WalrusDatastore) uploadConcatPack(ctx context.Context, pack []blockEntry) ([]KeyRecord, error) {
 	var total int64
 	for _, e := range pack {
 		total += int64(len(e.val))
@@ -658,7 +803,7 @@ func (w *WalrusDatastore) storeConcatPack(ctx context.Context, pack []blockEntry
 
 	res, err := w.client.Store(ctx, buf, w.conf.Epochs, w.conf.Deletable)
 	if err != nil {
-		return fmt.Errorf("walrusds: storing pack of %d blocks: %w", len(pack), err)
+		return nil, fmt.Errorf("walrusds: storing pack of %d blocks: %w", len(pack), err)
 	}
 
 	// One blob backs the whole concat pack: record its encoded size and cost on
@@ -676,5 +821,5 @@ func (w *WalrusDatastore) storeConcatPack(ctx context.Context, pack []blockEntry
 		recs[i].Rec.EndEpoch = res.EndEpoch
 		recs[i].Rec.ExpiresAt = expiry
 	}
-	return w.index.PutMany(ctx, recs)
+	return recs, nil
 }
