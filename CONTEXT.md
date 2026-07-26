@@ -38,7 +38,7 @@ We worked through several options before landing here:
 - Walrus-first, index-second write ordering (a failure leaks a recoverable blob, never a
   dangling index row).
 - **Block packing (v3 — Walrus Quilt):** `Batch.Commit` groups blocks into packs up to
-  `PackTargetSize` (default **64 MiB**) **and** at most **666** blocks (the QuiltV1 member limit),
+  `PackTargetSize` (default **256 MiB**) **and** at most **666** blocks (the QuiltV1 member limit),
   then stores each pack as a single Walrus **quilt** via the publisher's `PUT /v1/quilts`
   (multipart, one file part per block; identifier = block's index in the pack). The store
   response returns the quilt's own `blobId` plus a `quiltPatchId` per member. Each index row
@@ -68,8 +68,10 @@ We worked through several options before landing here:
   bytes to a Postgres **staging table** (`<table>_staging`) and return — the durability contract
   holds because Postgres *is* the durable store. A background **flusher** (`PackFlushInterval`
   ticker + a kick after every commit) claims staged blocks FIFO once ≥ `PackTargetSize` bytes
-  (or ≤666 for quilts) have accumulated — or once the oldest staged block is older than
-  `PackMaxAge` (default 5 min) — and uploads full packs, up to `Workers` packs in parallel.
+  (or ≤666 for quilts) have accumulated — or once ingest goes quiet for `PackIdleFlush`
+  (default 30 s; quiescence = the upload finished, so its tail flushes right away) — or once the
+  oldest staged block is older than `PackMaxAge` (default 5 min; backstop for continuous
+  trickle) — and uploads full packs, up to `Workers` packs in parallel.
   Claims use a `leased_until` lease (15 min) so multiple nodes sharing the DB never pack the
   same blocks; a crashed flusher's lease expires and the claim is retried (safe: Walrus uploads
   are content-addressed/idempotent). `PromoteStaged` then atomically moves rows staging→index,
@@ -77,9 +79,10 @@ We worked through several options before landing here:
   Reads probe **staging first, then index** (that order can't miss a block mid-promote);
   `Query`/`List` UNIONs both tables; `Delete` purges both. Oversized blocks
   (≥ `PackTargetSize`) skip staging and upload directly as plain blobs. Kubo's
-  `Import.BatchMaxSize` no longer matters for pack size (any Kubo version fills 64 MiB packs);
-  1 MiB chunking (`Import.UnixFSChunker=size-1048576`, Kubo v0.40+) still helps by reducing
-  block count. Walrus max blob size is 13.6 GiB; sweet spot for packs remains ~32–64 MiB.
+  `Import.BatchMaxSize` no longer matters for pack size (any Kubo version fills packs up to
+  `PackTargetSize`); 1 MiB chunking (`Import.UnixFSChunker=size-1048576`, Kubo v0.40+) still
+  helps by reducing block count. Walrus max blob size is 13.6 GiB; default pack target is
+  256 MiB.
 - **Epoch renewal — per distinct `blob_id`** (so a packed blob / quilt is renewed once, not once
   per block). Two mechanisms and two ways to drive them:
   - **Mechanisms:**
@@ -213,11 +216,11 @@ Datastore type name registered with Kubo: `walrusds`.
    inside the shared blob; reclaiming space needs a future compaction/GC pass (read live
    blocks, repack, let the old blob expire). Re-upload renewal carries any dead bytes along; the
    `renew.js` *extend* path leaves the blob untouched (so it keeps the same dead weight too).
-6. **Pack sizing** — `packTargetSizeBytes` defaults to 64 MiB (requires a self-hosted
+6. **Pack sizing** — `packTargetSizeBytes` defaults to 256 MiB (requires a self-hosted
    publisher/aggregator; public services cap requests near 10 MiB). Bigger packs amortize the
    ~64 MB per-blob metadata floor further but carry more dead weight after deletes and cost
-   more memory per in-flight upload (`Workers × PackTargetSize`). Pairs well with raising the
-   IPFS chunk size to 1 MiB.
+   more memory per in-flight upload (`Workers × PackTargetSize`; ~4 GiB at defaults). Pairs
+   well with raising the IPFS chunk size to 1 MiB.
 7. **Staging table operations** — `<table>_staging` churns (insert → claim → delete per block);
    monitor autovacuum/bloat under heavy ingest. Blocks not yet flushed live only in Postgres
    (still durable, served from staging on reads) for at most `packMaxAgeSeconds` + one flush;

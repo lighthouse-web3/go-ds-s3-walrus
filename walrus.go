@@ -33,9 +33,9 @@ import (
 const (
 	// defaultWorkers is the pack flusher's upload concurrency. Each in-flight
 	// pack holds its bytes in memory while uploading, so peak memory scales
-	// with workers × PackTargetSize; 16 keeps that bounded (≈1 GiB at the 64
-	// MiB default) while still saturating a self-hosted publisher. Raise it
-	// only alongside more RAM (and a matching maxOpenConns).
+	// with workers × PackTargetSize; 16 × the 256 MiB default is ≈4 GiB peak,
+	// so lower workers on smaller hosts. Raise it only alongside more RAM
+	// (and a matching maxOpenConns).
 	defaultWorkers = 16
 	// defaultMaxOpenConns bounds the Postgres connection pool. Commit fans out
 	// to `workers` goroutines that each run a PutMany, plus reads/renewal, so
@@ -46,20 +46,19 @@ const (
 	defaultEpochs         = 1
 	defaultRequestTimeout = 60 * time.Second
 	defaultMaxRetries     = 3
-	// defaultPackTargetSize is the target (maximum) size of a packed Walrus
-	// blob. It is a ceiling, not a floor: Batch.Commit flushes whatever it has
-	// buffered, so a small file still uploads immediately as a smaller blob.
-	// 64 MiB amortizes the per-blob Walrus cost (Sui gas + WAL minimums +
-	// erasure-coding overhead) across many blocks while staying well within
-	// memory and read-amplification limits. Public Walrus services cap
+	// defaultPackTargetSize is the target size of a packed Walrus blob. The
+	// staging flusher accumulates blocks across commits until this many bytes
+	// (or quiltMaxPatches) are ready, amortizing Walrus's fixed ~64 MB
+	// per-blob metadata overhead. 256 MiB is large enough that typical
+	// multi-tens-of-MB files land in one quilt. Public Walrus services cap
 	// requests near 10 MiB, so packs this large require a self-hosted
 	// publisher/aggregator (expected on mainnet anyway).
-	defaultPackTargetSize = 64 << 20 // 64 MiB
+	defaultPackTargetSize = 256 << 20 // 256 MiB
 	// defaultBlobCacheBytes is the default in-memory budget for caching whole
 	// blobs to serve range reads of packed blocks. Sized so a single
-	// default-target pack (64 MiB) stays cacheable (per-entry cap is a quarter
+	// default-target pack (256 MiB) stays cacheable (per-entry cap is a quarter
 	// of the budget).
-	defaultBlobCacheBytes = 256 << 20 // 256 MiB
+	defaultBlobCacheBytes = 1 << 30 // 1 GiB
 	// quiltMaxPatches is the maximum number of member blobs in a single
 	// QuiltV1. It is fixed by the protocol (derived from the 1000-shard
 	// committee: 667 secondary columns minus one reserved for the index).
@@ -73,11 +72,21 @@ const (
 	// defaultPackMaxAge is how long a block may sit in the Postgres staging
 	// buffer before it is flushed to Walrus even though a full pack has not
 	// accumulated. Staged blocks are already durable (Postgres), so this only
-	// bounds how long bytes are served from Postgres instead of Walrus.
+	// bounds how long bytes are served from Postgres instead of Walrus. It is
+	// the backstop for continuous trickle ingest, where the idle trigger
+	// (defaultPackIdleFlush) never fires.
 	defaultPackMaxAge = 5 * time.Minute
+	// defaultPackIdleFlush is how long the staging buffer must receive no new
+	// blocks before its partial tail is flushed to Walrus. Quiescence is the
+	// signal that an upload has finished: the tail of an `ipfs add` reaches
+	// Walrus seconds after the last block instead of waiting out PackMaxAge,
+	// while a stream of back-to-back writes keeps accumulating full packs.
+	defaultPackIdleFlush = 30 * time.Second
 	// defaultPackFlushInterval is how often the flusher re-checks the staging
-	// buffer, independently of the kicks it gets after every Commit.
-	defaultPackFlushInterval = 15 * time.Second
+	// buffer, independently of the kicks it gets after every Commit. It also
+	// bounds how quickly the idle trigger is noticed, so it stays below
+	// defaultPackIdleFlush.
+	defaultPackFlushInterval = 5 * time.Second
 	// stageLease is how long a flusher's claim on staged rows lasts. It must
 	// comfortably exceed the worst-case pack upload (RequestTimeout × retries
 	// × publishers); an expired lease simply lets another flusher retry, which
@@ -143,6 +152,13 @@ type Config struct {
 	// slightly longer Postgres-served reads for fuller (cheaper) packs.
 	// Defaults to defaultPackMaxAge.
 	PackMaxAge time.Duration
+	// PackIdleFlush flushes the partial tail of the staging buffer once no new
+	// blocks have been staged for this long — i.e. the ingest has finished —
+	// so an upload's last pack reaches Walrus promptly instead of waiting out
+	// PackMaxAge. Uploads with pauses longer than this flush a pack per pause;
+	// raise it if your ingest is bursty and packing density matters more than
+	// tail latency. Defaults to defaultPackIdleFlush.
+	PackIdleFlush time.Duration
 	// PackFlushInterval is how often the background flusher checks the staging
 	// buffer (it is additionally kicked after every Commit). Defaults to
 	// defaultPackFlushInterval.
@@ -222,6 +238,9 @@ func NewWalrusDatastore(conf Config) (*WalrusDatastore, error) {
 	}
 	if conf.PackMaxAge <= 0 {
 		conf.PackMaxAge = defaultPackMaxAge
+	}
+	if conf.PackIdleFlush <= 0 {
+		conf.PackIdleFlush = defaultPackIdleFlush
 	}
 	if conf.PackFlushInterval <= 0 {
 		conf.PackFlushInterval = defaultPackFlushInterval
@@ -581,10 +600,11 @@ func (w *WalrusDatastore) startFlushWorker(ctx context.Context) {
 	}()
 }
 
-// flushStaged uploads staged blocks as packs while a pack is "ripe": either a
-// full PackTargetSize of bytes has accumulated, or the oldest staged block
-// has waited PackMaxAge (so data reaches Walrus promptly even on quiet
-// nodes). It claims up to Workers packs at a time (leasing them against
+// flushStaged uploads staged blocks as packs while a pack is "ripe": a full
+// PackTargetSize of bytes has accumulated, no new blocks have arrived for
+// PackIdleFlush (the ingest finished, so its tail should reach Walrus now),
+// or the oldest staged block has waited PackMaxAge (backstop for continuous
+// trickle ingest). It claims up to Workers packs at a time (leasing them against
 // concurrent flushers) and uploads them in parallel; each pack is then
 // atomically moved from staging to the index. On upload failure the claim is
 // released for a later retry — the blocks stay durable in staging throughout.
@@ -607,7 +627,8 @@ func (w *WalrusDatastore) flushStaged(ctx context.Context) {
 				break
 			}
 			aged := st.Oldest.Valid && time.Since(st.Oldest.Time) >= w.conf.PackMaxAge
-			if st.Bytes < w.conf.PackTargetSize && !aged {
+			idle := st.Newest.Valid && time.Since(st.Newest.Time) >= w.conf.PackIdleFlush
+			if st.Bytes < w.conf.PackTargetSize && !aged && !idle {
 				break
 			}
 
