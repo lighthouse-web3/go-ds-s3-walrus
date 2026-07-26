@@ -63,19 +63,21 @@ CREATE TABLE walrus_index_staging (
 **Block packing (Walrus Quilt).** Walrus bills by *encoded* size: ~4.5× the raw bytes **plus a
 fixed ~64 MB of per-blob metadata** — so every under-filled blob costs ~68 MB minimum no matter
 how little data it holds. To amortize that, the plugin packs many IPFS blocks (up to
-`packTargetSizeBytes`, default 64 MiB, and at most 666 blocks) into a single Walrus
+`packTargetSizeBytes`, default 256 MiB, and at most 666 blocks) into a single Walrus
 [**quilt**](https://docs.wal.app/docs/system-overview/quilt) — Walrus's native batch-storage
 primitive, which can cut small-blob storage cost by >400x. Each `key` row records `blob_id` (the
 quilt's own blob ID) and `patch_id` (its `QuiltPatchID`); `Get` reads just that member via the
 aggregator's `by-quilt-patch-id` endpoint, so only the requested block transfers.
 
 **Cross-commit staging (how packs fill).** A single Kubo `Batch.Commit` rarely carries anywhere
-near 64 MiB, so uploading per commit would create one under-filled (~68 MB-billed) blob per
-commit. Instead, `Put`/`Commit` write block bytes durably to a Postgres **staging table**
+near the pack target, so uploading per commit would create one under-filled (~68 MB-billed) blob
+per commit. Instead, `Put`/`Commit` write block bytes durably to a Postgres **staging table**
 (`<table>_staging`, created automatically) and return immediately — durability holds because
 Postgres is the durable store. A background flusher packs staged blocks FIFO into full-size
-quilts once `packTargetSizeBytes` has accumulated, or after `packMaxAgeSeconds` (default 300) so
-blocks never wait indefinitely, uploading up to `workers` packs in parallel. Staged-but-unflushed
+quilts once `packTargetSizeBytes` has accumulated, as soon as ingest goes quiet for
+`packIdleFlushSeconds` (default 30 — so an upload's tail reaches Walrus shortly after its last
+block), or after `packMaxAgeSeconds` (default 300) so blocks never wait indefinitely, uploading
+up to `workers` packs in parallel. Staged-but-unflushed
 blocks are fully readable (served from Postgres) and deletable; claims are leased so multiple
 nodes sharing the database never pack the same blocks twice. Kubo's `Import.BatchMaxSize` no
 longer limits pack size.
@@ -266,11 +268,12 @@ Notes:
 | `deletable` | no | `false` | Register blobs as deletable on Walrus. |
 | `workers` | no | `16` | How many packs the background flusher uploads to Walrus in parallel. Peak upload memory ≈ `workers × packTargetSizeBytes`, so raise this together with host RAM (and `maxOpenConns`). |
 | `maxOpenConns` | no | `32` | Upper bound on the Postgres connection pool. Keep it ≥ `workers` so committing packs does not starve on connections; an unbounded pool can exhaust Postgres' `max_connections`. |
-| `packTargetSizeBytes` | no | `67108864` (64 MiB) | Target size of a packed Walrus blob. Blocks are staged durably in Postgres across commits and flushed as one quilt (≤666 blocks) once this many bytes accumulate, so packs actually fill regardless of Kubo's commit size. Packs >10 MiB require a self-hosted publisher/aggregator (public services cap requests near 10 MiB). |
-| `packMaxAgeSeconds` | no | `300` | Longest a block waits in the Postgres staging buffer for a pack to fill before being flushed to Walrus anyway. Staged blocks are already durable and readable; this only bounds how long they are served from Postgres instead of Walrus. |
-| `packFlushIntervalSeconds` | no | `15` | How often the flusher re-checks the staging buffer (it is also kicked immediately after every commit). |
+| `packTargetSizeBytes` | no | `268435456` (256 MiB) | Target size of a packed Walrus blob. Blocks are staged durably in Postgres across commits and flushed as one quilt (≤666 blocks) once this many bytes accumulate, so packs actually fill regardless of Kubo's commit size. Packs >10 MiB require a self-hosted publisher/aggregator (public services cap requests near 10 MiB). Peak flush memory ≈ `workers × packTargetSizeBytes`. |
+| `packMaxAgeSeconds` | no | `300` | Longest a block waits in the Postgres staging buffer for a pack to fill before being flushed to Walrus anyway (backstop for continuous trickle ingest). Staged blocks are already durable and readable; this only bounds how long they are served from Postgres instead of Walrus. |
+| `packIdleFlushSeconds` | no | `30` | Once no new blocks have been staged for this long (the upload finished), the partial tail is flushed to Walrus immediately instead of waiting out `packMaxAgeSeconds`. Raise it if your ingest pauses between files and packing density matters more than tail latency. |
+| `packFlushIntervalSeconds` | no | `5` | How often the flusher re-checks the staging buffer (it is also kicked immediately after every commit). |
 | `disableQuilt` | no | `false` | When `true`, pack batches as legacy concatenated blobs (read by byte range) instead of Walrus quilts. Existing rows of either kind keep working regardless. |
-| `blobCacheBytes` | no | `268435456` (256 MiB) | In-memory LRU budget for whole blobs, used to serve range reads of packed blocks. Per-entry cap is ¼ of this, so the default keeps a 64 MiB pack cacheable. A negative value disables the cache. |
+| `blobCacheBytes` | no | `1073741824` (1 GiB) | In-memory LRU budget for whole blobs, used to serve range reads of packed blocks. Per-entry cap is ¼ of this, so the default keeps a 256 MiB pack cacheable. A negative value disables the cache. |
 | `requestTimeoutSeconds` | no | `60` | Per-attempt Walrus HTTP timeout. |
 | `maxRetries` | no | `3` | Retries per Walrus request (exponential backoff). |
 | `epochDurationSeconds` | no | `0` | Wall-clock length of one Walrus epoch. Enables the renewal worker when set. |

@@ -84,11 +84,15 @@ type StageEntry struct {
 }
 
 // StageStats summarizes the claimable (unleased) rows of the staging table so
-// the flusher can decide whether a pack is worth uploading yet.
+// the flusher can decide whether a pack is worth uploading yet. Oldest drives
+// the age-based flush (no block waits forever); Newest drives the idle-based
+// flush (ingest has gone quiet, so the tail of an upload flushes immediately
+// instead of waiting out the full age window).
 type StageStats struct {
 	Count  int64
 	Bytes  int64
 	Oldest sql.NullTime
+	Newest sql.NullTime
 }
 
 // Index is the durable key -> blob mapping. It is intentionally an interface
@@ -553,10 +557,10 @@ func (p *postgresIndex) StageGetSize(ctx context.Context, key string) (int64, er
 
 // StageStats reports the claimable (unleased or lease-expired) staging rows.
 func (p *postgresIndex) StageStats(ctx context.Context) (StageStats, error) {
-	q := fmt.Sprintf(`SELECT count(*), COALESCE(sum(size), 0), min(created_at) FROM %s
+	q := fmt.Sprintf(`SELECT count(*), COALESCE(sum(size), 0), min(created_at), max(created_at) FROM %s
 		WHERE leased_until IS NULL OR leased_until < now()`, p.stagingTable())
 	var st StageStats
-	if err := p.db.QueryRowContext(ctx, q).Scan(&st.Count, &st.Bytes, &st.Oldest); err != nil {
+	if err := p.db.QueryRowContext(ctx, q).Scan(&st.Count, &st.Bytes, &st.Oldest, &st.Newest); err != nil {
 		return StageStats{}, fmt.Errorf("walrusds: stage stats: %w", err)
 	}
 	return st, nil
