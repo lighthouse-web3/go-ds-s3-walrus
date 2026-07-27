@@ -278,6 +278,15 @@ func NewWalrusDatastore(conf Config) (*WalrusDatastore, error) {
 		cancel:    cancel,
 	}
 
+	// Log the packing knobs actually in effect. The pack target is the single
+	// most common source of surprise (an old binary or a stale config value
+	// silently caps pack size, so uploads split into extra blobs that each pay
+	// Walrus's fixed per-blob metadata overhead), and it is otherwise only
+	// observable by reverse-engineering blob sizes.
+	log.Printf("walrusds: packing config: packTargetSize=%d bytes, quilt=%t, packIdleFlush=%s, packMaxAge=%s, packFlushInterval=%s, workers=%d",
+		conf.PackTargetSize, !conf.DisableQuilt, conf.PackIdleFlush, conf.PackMaxAge,
+		conf.PackFlushInterval, conf.Workers)
+
 	w.startFlushWorker(ctx)
 
 	if conf.RenewInterval > 0 && conf.EpochDuration > 0 {
@@ -678,9 +687,11 @@ func (w *WalrusDatastore) flushStaged(ctx context.Context) {
 func (w *WalrusDatastore) flushOnePack(ctx context.Context, entries []StageEntry) error {
 	pack := make([]blockEntry, len(entries))
 	keys := make([]string, len(entries))
+	var total int64
 	for i, e := range entries {
 		pack[i] = blockEntry{key: e.Key, val: e.Value}
 		keys[i] = e.Key
+		total += int64(len(e.Value))
 	}
 
 	recs, err := w.uploadPack(ctx, pack)
@@ -693,6 +704,12 @@ func (w *WalrusDatastore) flushOnePack(ctx context.Context, entries []StageEntry
 		}
 		return fmt.Errorf("flushing pack of %d blocks: %w", len(pack), err)
 	}
+
+	var blobID string
+	if len(recs) > 0 {
+		blobID = recs[0].Rec.BlobID
+	}
+	log.Printf("walrusds: stored pack: %d blocks, %d bytes, blob=%s", len(pack), total, blobID)
 	return nil
 }
 
