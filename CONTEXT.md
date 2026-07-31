@@ -69,9 +69,10 @@ We worked through several options before landing here:
   holds because Postgres *is* the durable store. A background **flusher** (`PackFlushInterval`
   ticker + a kick after every commit) claims staged blocks FIFO once ≥ `PackTargetSize` bytes
   (or ≤666 for quilts) have accumulated — or once ingest goes quiet for `PackIdleFlush`
-  (default 30 s; quiescence = the upload finished, so its tail flushes right away) — or once the
-  oldest staged block is older than `PackMaxAge` (default 5 min; backstop for continuous
-  trickle) — and uploads full packs, up to `Workers` packs in parallel.
+  (default 3 min; quiescence = the upload finished, so its tail flushes without chopping
+  mid-ingest pauses) — or once the oldest staged block is older than `PackMaxAge` (default
+  30 min; backstop for continuous trickle) — and uploads full packs, up to `Workers` packs
+  in parallel.
   Claims use a `leased_until` lease (15 min) so multiple nodes sharing the DB never pack the
   same blocks; a crashed flusher's lease expires and the claim is retried (safe: Walrus uploads
   are content-addressed/idempotent). `PromoteStaged` then atomically moves rows staging→index,

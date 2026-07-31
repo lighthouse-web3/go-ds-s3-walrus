@@ -36,7 +36,7 @@ const (
 	// with workers × PackTargetSize; 16 × the 256 MiB default is ≈4 GiB peak,
 	// so lower workers on smaller hosts. Raise it only alongside more RAM
 	// (and a matching maxOpenConns).
-	defaultWorkers = 16
+	defaultWorkers = 4
 	// defaultMaxOpenConns bounds the Postgres connection pool. Commit fans out
 	// to `workers` goroutines that each run a PutMany, plus reads/renewal, so
 	// the pool must comfortably exceed Workers; 32 covers the default worker
@@ -44,7 +44,7 @@ const (
 	// Postgres' max_connections under load.
 	defaultMaxOpenConns   = 32
 	defaultEpochs         = 1
-	defaultRequestTimeout = 60 * time.Second
+	defaultRequestTimeout = 120 * time.Second
 	defaultMaxRetries     = 3
 	// defaultPackTargetSize is the target size of a packed Walrus blob. The
 	// staging flusher accumulates blocks across commits until this many bytes
@@ -53,7 +53,7 @@ const (
 	// multi-tens-of-MB files land in one quilt. Public Walrus services cap
 	// requests near 10 MiB, so packs this large require a self-hosted
 	// publisher/aggregator (expected on mainnet anyway).
-	defaultPackTargetSize = 256 << 20 // 256 MiB
+	defaultPackTargetSize = 1024 << 20 // 1024 MiB
 	// defaultBlobCacheBytes is the default in-memory budget for caching whole
 	// blobs to serve range reads of packed blocks. Sized so a single
 	// default-target pack (256 MiB) stays cacheable (per-entry cap is a quarter
@@ -74,24 +74,29 @@ const (
 	// accumulated. Staged blocks are already durable (Postgres), so this only
 	// bounds how long bytes are served from Postgres instead of Walrus. It is
 	// the backstop for continuous trickle ingest, where the idle trigger
-	// (defaultPackIdleFlush) never fires.
-	defaultPackMaxAge = 5 * time.Minute
+	// (defaultPackIdleFlush) never fires. It must comfortably exceed a slow
+	// multi-hundred-MB `ipfs add`: a short max-age fires mid-ingest and splits
+	// one logical upload into under-filled packs (each paying Walrus's fixed
+	// per-blob metadata overhead).
+	defaultPackMaxAge = 30 * time.Minute
 	// defaultPackIdleFlush is how long the staging buffer must receive no new
 	// blocks before its partial tail is flushed to Walrus. Quiescence is the
 	// signal that an upload has finished: the tail of an `ipfs add` reaches
-	// Walrus seconds after the last block instead of waiting out PackMaxAge,
-	// while a stream of back-to-back writes keeps accumulating full packs.
-	defaultPackIdleFlush = 30 * time.Second
+	// Walrus after the last block instead of waiting out PackMaxAge, while a
+	// stream of back-to-back writes keeps accumulating full packs. Kept well
+	// above typical pauses inside a single add (chunker/DAG commits) so a
+	// 100 MB file under a 256 MiB pack target lands in one quilt.
+	defaultPackIdleFlush = 3 * time.Minute
 	// defaultPackFlushInterval is how often the flusher re-checks the staging
 	// buffer, independently of the kicks it gets after every Commit. It also
 	// bounds how quickly the idle trigger is noticed, so it stays below
 	// defaultPackIdleFlush.
-	defaultPackFlushInterval = 5 * time.Second
+	defaultPackFlushInterval = 15 * time.Second
 	// stageLease is how long a flusher's claim on staged rows lasts. It must
 	// comfortably exceed the worst-case pack upload (RequestTimeout × retries
 	// × publishers); an expired lease simply lets another flusher retry, which
 	// is safe because Walrus uploads are content-addressed (idempotent).
-	stageLease = 15 * time.Minute
+	stageLease = 30 * time.Minute
 )
 
 var (
@@ -168,7 +173,7 @@ type Config struct {
 	// defaultBlobCacheBytes; a negative value disables the cache.
 	BlobCacheBytes int64
 
-	// RequestTimeout bounds a single Walrus HTTP attempt. Defaults to 60s.
+	// RequestTimeout bounds a single Walrus HTTP attempt. Defaults to 120s.
 	RequestTimeout time.Duration
 	// MaxRetries is the number of retries per Walrus request. Defaults to 3.
 	MaxRetries int
@@ -639,6 +644,16 @@ func (w *WalrusDatastore) flushStaged(ctx context.Context) {
 			idle := st.Newest.Valid && time.Since(st.Newest.Time) >= w.conf.PackIdleFlush
 			if st.Bytes < w.conf.PackTargetSize && !aged && !idle {
 				break
+			}
+			// Below-target flushes are timing-triggered; log why so operators can
+			// tell an intentional tail flush (idle) from the age backstop firing
+			// mid-upload (which splits the ingest into under-filled packs).
+			if st.Bytes < w.conf.PackTargetSize {
+				reason := "max-age reached"
+				if idle {
+					reason = "ingest idle"
+				}
+				log.Printf("walrusds: flushing partial pack: %d blocks, %d bytes (%s)", st.Count, st.Bytes, reason)
 			}
 
 			entries, err := w.index.StageClaim(ctx, maxCount, w.conf.PackTargetSize, stageLease)

@@ -52,14 +52,14 @@ func (WalrusPlugin) DatastoreTypeName() string {
 //   - "deletable"             (bool;   register blobs as deletable)
 //   - "workers"               (number; batch concurrency, default 16)
 //   - "maxOpenConns"          (number; Postgres pool size, default 32)
-//   - "requestTimeoutSeconds" (number; per-attempt Walrus HTTP timeout)
+//   - "requestTimeoutSeconds" (number; per-attempt Walrus HTTP timeout, default 120)
 //   - "maxRetries"            (number; retries per Walrus request)
 //   - "packTargetSizeBytes"   (number; target packed-blob size, default 256 MiB)
 //   - "packMaxAgeSeconds"     (number; max time a block waits in the Postgres
-//     staging buffer for a pack to fill before flushing anyway, default 300)
+//     staging buffer for a pack to fill before flushing anyway, default 1800)
 //   - "packIdleFlushSeconds"  (number; flush the staging tail once no new blocks
-//     have arrived for this long — i.e. the upload finished, default 30)
-//   - "packFlushIntervalSeconds" (number; staging-buffer check interval, default 5)
+//     have arrived for this long — i.e. the upload finished, default 180)
+//   - "packFlushIntervalSeconds" (number; staging-buffer check interval, default 15)
 //   - "disableQuilt"          (bool;   pack batches as concatenated blobs instead of quilts)
 //   - "blobCacheBytes"        (number; LRU budget for range reads, default 1 GiB)
 //   - "epochDurationSeconds"  (number; wall-clock length of one epoch; enables renewal)
