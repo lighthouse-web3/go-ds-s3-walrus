@@ -55,6 +55,7 @@ CREATE TABLE walrus_index_staging (
   key          TEXT PRIMARY KEY,
   value        BYTEA NOT NULL,     -- block bytes awaiting packing
   size         BIGINT NOT NULL,
+  owner        TEXT NOT NULL DEFAULT '', -- nodeID of the staging node (its flusher uploads it)
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
   leased_until TIMESTAMPTZ         -- flusher claim lease (multi-node safety)
 );
@@ -78,9 +79,12 @@ quilts once `packTargetSizeBytes` has accumulated, as soon as ingest goes quiet 
 `packIdleFlushSeconds` (default 180 — so an upload's tail reaches Walrus after the add goes
 quiet, without chopping mid-ingest pauses), or after `packMaxAgeSeconds` (default 1800) so
 blocks never wait indefinitely, uploading up to `workers` packs in parallel. Staged-but-unflushed
-blocks are fully readable (served from Postgres) and deletable; claims are leased so multiple
-nodes sharing the database never pack the same blocks twice. Kubo's `Import.BatchMaxSize` no
-longer limits pack size.
+blocks are fully readable (served from Postgres) and deletable. Each staged row is stamped with
+the stager's `nodeID`, and every node's flusher claims only its own rows — so on a shared
+database each node uploads (and pays for, via its own publisher/wallet) exactly the blocks it
+staged; rows orphaned by a dead node become adoptable after `stageTakeoverSeconds`, and leased
+claims keep concurrent flushers from ever packing the same block twice. Kubo's
+`Import.BatchMaxSize` no longer limits pack size.
 
 Set `disableQuilt: true` to fall back to the **legacy concat scheme** instead: blocks are
 concatenated into one opaque blob and addressed by `blob_offset`/`size`, read back via HTTP
@@ -272,6 +276,8 @@ Notes:
 | `packMaxAgeSeconds` | no | `1800` (30 min) | Longest a block waits in the Postgres staging buffer for a pack to fill before being flushed to Walrus anyway (backstop for continuous trickle ingest). Must exceed a slow multi-hundred-MB `ipfs add` or the age flush will split one upload into under-filled packs. |
 | `packIdleFlushSeconds` | no | `180` (3 min) | Once no new blocks have been staged for this long (the upload finished), the partial tail is flushed to Walrus instead of waiting out `packMaxAgeSeconds`. Kept above typical pauses inside a single add so a file under `packTargetSizeBytes` lands in one quilt. |
 | `packFlushIntervalSeconds` | no | `15` | How often the flusher re-checks the staging buffer (it is also kicked immediately after every commit). |
+| `nodeID` | no | OS hostname | Identity stamped on blocks this node stages. Each node's flusher claims only its own staged rows, so on a shared database every node uploads through its own publisher and pays with its own wallet. Must be stable across restarts and unique per node sharing the database — the node's Sui wallet address is a good value. |
+| `stageTakeoverSeconds` | no | `3600` (2 × `packMaxAgeSeconds`) | How long a block staged by another node must sit unflushed before this node's flusher may adopt and upload it. Crash recovery for a node that died after staging; re-upload is idempotent (blob IDs are content-derived). Must comfortably exceed `packMaxAgeSeconds`. |
 | `disableQuilt` | no | `false` | When `true`, pack batches as legacy concatenated blobs (read by byte range) instead of Walrus quilts. Existing rows of either kind keep working regardless. |
 | `blobCacheBytes` | no | `1073741824` (1 GiB) | In-memory LRU budget for whole blobs, used to serve range reads of packed blocks. Per-entry cap is ¼ of this, so the default keeps a 256 MiB pack cacheable. A negative value disables the cache. |
 | `requestTimeoutSeconds` | no | `120` | Per-attempt Walrus HTTP timeout (covers a full pack/quilt upload). |

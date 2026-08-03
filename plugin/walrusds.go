@@ -60,6 +60,12 @@ func (WalrusPlugin) DatastoreTypeName() string {
 //   - "packIdleFlushSeconds"  (number; flush the staging tail once no new blocks
 //     have arrived for this long — i.e. the upload finished, default 180)
 //   - "packFlushIntervalSeconds" (number; staging-buffer check interval, default 15)
+//   - "nodeID"                (string; identity stamped on staged blocks so this
+//     node's flusher claims — and pays for — only its own blocks; must be
+//     stable across restarts and unique per node, default OS hostname)
+//   - "stageTakeoverSeconds"  (number; how long another node's staged block
+//     must sit unflushed before any node may adopt it — crash recovery for a
+//     dead stager, default 2 × packMaxAgeSeconds)
 //   - "disableQuilt"          (bool;   pack batches as concatenated blobs instead of quilts)
 //   - "blobCacheBytes"        (number; LRU budget for range reads, default 1 GiB)
 //   - "epochDurationSeconds"  (number; wall-clock length of one epoch; enables renewal)
@@ -144,11 +150,25 @@ func (WalrusPlugin) DatastoreConfigParser() fsrepo.ConfigFromMap {
 		}
 		cfg.PackIdleFlush = time.Duration(packIdleSecs) * time.Second
 
-		packFlushSecs, err := optionalPositiveInt(m, "packFlushIntervalSeconds")
-		if err != nil {
-			return nil, err
+	packFlushSecs, err := optionalPositiveInt(m, "packFlushIntervalSeconds")
+	if err != nil {
+		return nil, err
+	}
+	cfg.PackFlushInterval = time.Duration(packFlushSecs) * time.Second
+
+	if v, ok := m["nodeID"]; ok {
+		s, ok := v.(string)
+		if !ok {
+			return nil, fmt.Errorf("walrusds: nodeID not a string")
 		}
-		cfg.PackFlushInterval = time.Duration(packFlushSecs) * time.Second
+		cfg.NodeID = s
+	}
+
+	takeoverSecs, err := optionalPositiveInt(m, "stageTakeoverSeconds")
+	if err != nil {
+		return nil, err
+	}
+	cfg.StageTakeover = time.Duration(takeoverSecs) * time.Second
 
 		cacheBytes, err := optionalPositiveInt(m, "blobCacheBytes")
 		if err != nil {

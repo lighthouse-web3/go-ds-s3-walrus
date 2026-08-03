@@ -83,11 +83,12 @@ type StageEntry struct {
 	Value []byte
 }
 
-// StageStats summarizes the claimable (unleased) rows of the staging table so
-// the flusher can decide whether a pack is worth uploading yet. Oldest drives
-// the age-based flush (no block waits forever); Newest drives the idle-based
-// flush (ingest has gone quiet, so the tail of an upload flushes immediately
-// instead of waiting out the full age window).
+// StageStats summarizes the rows of the staging table claimable by this node
+// (its own, owner-less legacy rows, and takeover-aged orphans; unleased or
+// lease-expired) so the flusher can decide whether a pack is worth uploading
+// yet. Oldest drives the age-based flush (no block waits forever); Newest
+// drives the idle-based flush (ingest has gone quiet, so the tail of an
+// upload flushes immediately instead of waiting out the full age window).
 type StageStats struct {
 	Count  int64
 	Bytes  int64
@@ -109,17 +110,25 @@ type Index interface {
 	UpdateBlobAfterRenewal(ctx context.Context, oldBlobID, newBlobID, newObjectID string, encodedSize int64, cost uint64, endEpoch uint64, expiresAt sql.NullTime) error
 
 	// Staging buffer: durable cross-commit accumulation of blocks so the
-	// flusher can build full-size packs. See StageEntry.
+	// flusher can build full-size packs. See StageEntry. Staged rows are
+	// owned by the node that wrote them: a node's flusher claims only its
+	// own rows (uploads are paid by that node's own publisher/wallet), plus
+	// foreign rows old enough to adopt (see StageStats).
 	StagePutMany(ctx context.Context, entries []StageEntry) error
 	StageGet(ctx context.Context, key string) ([]byte, error)
 	StageGetSize(ctx context.Context, key string) (int64, error)
+	// StageStats summarizes the staging rows this node may claim — its own,
+	// legacy owner-less rows, and rows orphaned longer than the takeover
+	// window — so the flusher can decide whether a pack is worth uploading
+	// yet.
 	StageStats(ctx context.Context) (StageStats, error)
-	// StageClaim leases up to maxCount unleased staged blocks whose cumulative
-	// size stays within maxBytes (always at least one row when any is
-	// claimable), so concurrent flushers on different nodes never build packs
-	// from the same blocks. The lease expires automatically, making a crashed
-	// flusher's claim recoverable; the upload is idempotent (Walrus blob IDs
-	// are content-derived), so a re-claim after a crash is safe.
+	// StageClaim leases up to maxCount unleased staged blocks this node owns
+	// (or may adopt) whose cumulative size stays within maxBytes (always at
+	// least one row when any is claimable), so concurrent flushers never
+	// build packs from the same blocks. The lease expires automatically,
+	// making a crashed flusher's claim recoverable; the upload is idempotent
+	// (Walrus blob IDs are content-derived), so a re-claim after a crash is
+	// safe.
 	StageClaim(ctx context.Context, maxCount int, maxBytes int64, lease time.Duration) ([]StageEntry, error)
 	// StageRelease returns claimed rows to the claimable pool after a failed
 	// upload so the next flush retries them.
@@ -138,6 +147,13 @@ type Index interface {
 type postgresIndex struct {
 	db    *sql.DB
 	table string
+	// nodeID is stamped on every row this node stages and scopes which rows
+	// its flusher claims, so each node's uploads go through its own
+	// publisher/wallet. stageTakeover is how long a foreign-owned row must
+	// sit unflushed before any node may adopt it — the crash-recovery path
+	// for a node that died after staging.
+	nodeID        string
+	stageTakeover time.Duration
 }
 
 // stagingTable is the name of the staging buffer table paired with the index
@@ -155,9 +171,11 @@ const putManyChunk = 500
 const putManyParams = 11
 
 // newPostgresIndex opens the Postgres connection, verifies connectivity and
-// ensures the backing table and indexes exist. maxOpenConns bounds the
-// connection pool; a value <= 0 applies defaultMaxOpenConns.
-func newPostgresIndex(ctx context.Context, dsn, table string, maxOpenConns int) (*postgresIndex, error) {
+// ensures the backing table and indexes exist. nodeID is the identity stamped
+// on staged rows and used to scope flush claims; stageTakeover is the age
+// after which foreign-owned staged rows become adoptable. maxOpenConns bounds
+// the connection pool; a value <= 0 applies defaultMaxOpenConns.
+func newPostgresIndex(ctx context.Context, dsn, table, nodeID string, stageTakeover time.Duration, maxOpenConns int) (*postgresIndex, error) {
 	if table == "" {
 		table = "walrus_index"
 	}
@@ -186,7 +204,7 @@ func newPostgresIndex(ctx context.Context, dsn, table string, maxOpenConns int) 
 		return nil, fmt.Errorf("walrusds: connecting to postgres: %w", err)
 	}
 
-	idx := &postgresIndex{db: db, table: table}
+	idx := &postgresIndex{db: db, table: table, nodeID: nodeID, stageTakeover: stageTakeover}
 	if err := idx.migrate(ctx); err != nil {
 		db.Close()
 		return nil, err
@@ -227,15 +245,23 @@ func (p *postgresIndex) migrate(ctx context.Context) error {
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_blob_id_idx ON %s (blob_id)`, p.table, p.table),
 		// Staging buffer: blocks land here durably at Commit time and are moved
 		// to the index (and Walrus) by the pack flusher. leased_until implements
-		// the claim lease; created_at drives FIFO packing and age-based flushes.
+		// the claim lease; created_at drives FIFO packing and age-based flushes;
+		// owner records which node staged the row so each node's flusher claims
+		// (and pays for) its own blocks.
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			key          TEXT PRIMARY KEY,
 			value        BYTEA NOT NULL,
 			size         BIGINT NOT NULL,
+			owner        TEXT NOT NULL DEFAULT '',
 			created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
 			leased_until TIMESTAMPTZ
 		)`, p.stagingTable()),
+		// Backward compatibility: staging tables created before owner-scoped
+		// flushing lack the stager's identity. Rows with an empty owner stay
+		// claimable by every node, so pre-upgrade leftovers flush as before.
+		fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS owner TEXT NOT NULL DEFAULT ''`, p.stagingTable()),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_created_idx ON %s (created_at)`, p.stagingTable(), p.stagingTable()),
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_owner_created_idx ON %s (owner, created_at)`, p.stagingTable(), p.stagingTable()),
 	}
 	for _, s := range stmts {
 		if _, err := p.db.ExecContext(ctx, s); err != nil {
@@ -471,13 +497,15 @@ func (p *postgresIndex) UpdateBlobAfterRenewal(ctx context.Context, oldBlobID, n
 	return nil
 }
 
-// stagePutChunk bounds rows per multi-row staging INSERT (3 bound params per
+// stagePutChunk bounds rows per multi-row staging INSERT (4 bound params per
 // row; the BYTEA values dominate the statement size, not the param count).
 const stagePutChunk = 200
 
-// StagePutMany durably buffers blocks in the staging table in one transaction.
-// Once this commits the datastore's durability contract is satisfied: the
-// bytes live in Postgres until the flusher packs them onto Walrus.
+// StagePutMany durably buffers blocks in the staging table in one transaction,
+// stamping each row with this node's identity so only this node's flusher
+// claims (and pays for) them. Once this commits the datastore's durability
+// contract is satisfied: the bytes live in Postgres until the flusher packs
+// them onto Walrus.
 func (p *postgresIndex) StagePutMany(ctx context.Context, entries []StageEntry) error {
 	if len(entries) == 0 {
 		return nil
@@ -497,24 +525,27 @@ func (p *postgresIndex) StagePutMany(ctx context.Context, entries []StageEntry) 
 
 		var (
 			sb   strings.Builder
-			args = make([]interface{}, 0, len(chunk)*3)
+			args = make([]interface{}, 0, len(chunk)*4)
 		)
-		sb.WriteString(fmt.Sprintf(`INSERT INTO %s (key, value, size, created_at, leased_until) VALUES `, p.stagingTable()))
+		sb.WriteString(fmt.Sprintf(`INSERT INTO %s (key, value, size, owner, created_at, leased_until) VALUES `, p.stagingTable()))
 		for i, e := range chunk {
 			if i > 0 {
 				sb.WriteByte(',')
 			}
-			b := i * 3
-			sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,now(),NULL)", b+1, b+2, b+3))
-			args = append(args, e.Key, e.Value, int64(len(e.Value)))
+			b := i * 4
+			sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,now(),NULL)", b+1, b+2, b+3, b+4))
+			args = append(args, e.Key, e.Value, int64(len(e.Value)), p.nodeID)
 		}
 		// A re-put of a staged key refreshes its bytes and clears any lease.
 		// Keys are content-addressed (same key => same bytes), so if the row was
 		// leased by an in-flight pack upload the subsequent promote simply lands
-		// the identical bytes.
+		// the identical bytes. Ownership moves to the latest writer: if the
+		// original stager died mid-flush, the re-putting node takes over
+		// flushing the block.
 		sb.WriteString(` ON CONFLICT (key) DO UPDATE SET
 			value        = EXCLUDED.value,
 			size         = EXCLUDED.size,
+			owner        = EXCLUDED.owner,
 			created_at   = now(),
 			leased_until = NULL`)
 
@@ -555,31 +586,40 @@ func (p *postgresIndex) StageGetSize(ctx context.Context, key string) (int64, er
 	return size, nil
 }
 
-// StageStats reports the claimable (unleased or lease-expired) staging rows.
+// StageStats reports the staging rows this node may claim (unleased or
+// lease-expired, and owned by this node, owner-less, or orphaned past the
+// takeover window). It must use the same ownership predicate as StageClaim:
+// the flusher's ripeness triggers are meaningless if they count rows the
+// claim would skip.
 func (p *postgresIndex) StageStats(ctx context.Context) (StageStats, error) {
 	q := fmt.Sprintf(`SELECT count(*), COALESCE(sum(size), 0), min(created_at), max(created_at) FROM %s
-		WHERE leased_until IS NULL OR leased_until < now()`, p.stagingTable())
+		WHERE (owner = $1 OR owner = '' OR created_at < now() - make_interval(secs => $2))
+			AND (leased_until IS NULL OR leased_until < now())`, p.stagingTable())
 	var st StageStats
-	if err := p.db.QueryRowContext(ctx, q).Scan(&st.Count, &st.Bytes, &st.Oldest, &st.Newest); err != nil {
+	if err := p.db.QueryRowContext(ctx, q, p.nodeID, p.stageTakeover.Seconds()).Scan(&st.Count, &st.Bytes, &st.Oldest, &st.Newest); err != nil {
 		return StageStats{}, fmt.Errorf("walrusds: stage stats: %w", err)
 	}
 	return st, nil
 }
 
-// StageClaim selects the oldest claimable rows up to maxCount / maxBytes and
-// leases them. Candidate selection and the leasing UPDATE are separate
-// statements, so a row grabbed by a concurrent flusher in between simply drops
-// out of the RETURNING set — both packs stay disjoint.
+// StageClaim selects the oldest rows this node may claim (its own, owner-less
+// legacy rows, and foreign rows orphaned past the takeover window) up to
+// maxCount / maxBytes, and leases them. Candidate selection and the leasing
+// UPDATE are separate statements, so a row grabbed by a concurrent flusher in
+// between simply drops out of the RETURNING set — packs stay disjoint. The
+// ownership predicate is applied in both statements and must match
+// StageStats.
 func (p *postgresIndex) StageClaim(ctx context.Context, maxCount int, maxBytes int64, lease time.Duration) ([]StageEntry, error) {
 	if maxCount <= 0 || maxBytes <= 0 {
 		return nil, nil
 	}
 
 	q := fmt.Sprintf(`SELECT key, size FROM %s
-		WHERE leased_until IS NULL OR leased_until < now()
+		WHERE (owner = $1 OR owner = '' OR created_at < now() - make_interval(secs => $2))
+			AND (leased_until IS NULL OR leased_until < now())
 		ORDER BY created_at, key
-		LIMIT $1`, p.stagingTable())
-	rows, err := p.db.QueryContext(ctx, q, maxCount)
+		LIMIT $3`, p.stagingTable())
+	rows, err := p.db.QueryContext(ctx, q, p.nodeID, p.stageTakeover.Seconds(), maxCount)
 	if err != nil {
 		return nil, fmt.Errorf("walrusds: stage claim select: %w", err)
 	}
@@ -611,10 +651,17 @@ func (p *postgresIndex) StageClaim(ctx context.Context, maxCount int, maxBytes i
 		return nil, nil
 	}
 
-	uq := fmt.Sprintf(`UPDATE %s SET leased_until = now() + $2
-		WHERE key = ANY($1) AND (leased_until IS NULL OR leased_until < now())
+	// The lease interval must go through make_interval: a bare time.Duration
+	// parameter arrives as nanoseconds but Postgres reads a bare interval
+	// literal as seconds, inflating the lease by 1e9. The ownership predicate
+	// is rechecked here so a row re-staged under a different owner between
+	// the SELECT and this UPDATE is left for that owner's flusher.
+	uq := fmt.Sprintf(`UPDATE %s SET leased_until = now() + make_interval(secs => $2)
+		WHERE key = ANY($1)
+			AND (owner = $3 OR owner = '' OR created_at < now() - make_interval(secs => $4))
+			AND (leased_until IS NULL OR leased_until < now())
 		RETURNING key, value`, p.stagingTable())
-	urows, err := p.db.QueryContext(ctx, uq, pq.Array(keys), lease)
+	urows, err := p.db.QueryContext(ctx, uq, pq.Array(keys), lease.Seconds(), p.nodeID, p.stageTakeover.Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("walrusds: stage claim lease: %w", err)
 	}

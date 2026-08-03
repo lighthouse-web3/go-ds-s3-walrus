@@ -73,9 +73,14 @@ We worked through several options before landing here:
   mid-ingest pauses) — or once the oldest staged block is older than `PackMaxAge` (default
   30 min; backstop for continuous trickle) — and uploads full packs, up to `Workers` packs
   in parallel.
-  Claims use a `leased_until` lease (15 min) so multiple nodes sharing the DB never pack the
-  same blocks; a crashed flusher's lease expires and the claim is retried (safe: Walrus uploads
-  are content-addressed/idempotent). `PromoteStaged` then atomically moves rows staging→index,
+  Claims are **owner-scoped** (v5): each staged row carries the stager's `nodeID`, and a node's
+  flusher claims only its own rows — on a shared DB every node uploads (and pays for, via its
+  own publisher/wallet) exactly what it staged. Rows orphaned by a dead node become adoptable
+  once older than `StageTakeover` (default 2 × `PackMaxAge`); owner-less legacy rows stay
+  claimable by everyone. A `leased_until` lease (30 min) keeps concurrent flushers from packing
+  the same blocks; a crashed flusher's lease expires and the claim is retried (safe: Walrus
+  uploads are content-addressed/idempotent). `PromoteStaged` then atomically moves rows
+  staging→index,
   inserting only keys still present in staging so a concurrent `Delete` wins (no resurrection).
   Reads probe **staging first, then index** (that order can't miss a block mid-promote);
   `Query`/`List` UNIONs both tables; `Delete` purges both. Oversized blocks

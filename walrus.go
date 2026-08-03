@@ -21,6 +21,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -168,6 +169,20 @@ type Config struct {
 	// buffer (it is additionally kicked after every Commit). Defaults to
 	// defaultPackFlushInterval.
 	PackFlushInterval time.Duration
+	// NodeID is this node's identity in the shared staging buffer: rows are
+	// stamped with it at Put/Commit time, and the flusher claims only rows
+	// this node owns, so every node's uploads go through its own publisher
+	// (its own wallet). It must be stable across restarts and unique per
+	// node sharing the database — the node's Sui wallet address is a good
+	// choice. Defaults to the OS hostname.
+	NodeID string
+	// StageTakeover is how long a block staged by another node must sit
+	// unflushed before this node's flusher may adopt and upload it. It is
+	// the crash-recovery path for a node that died after staging: healthy
+	// nodes eventually flush the orphans (idempotent — Walrus blob IDs are
+	// content-derived). It must comfortably exceed PackMaxAge so adoption
+	// only happens once the owner is truly gone. Defaults to 2 × PackMaxAge.
+	StageTakeover time.Duration
 	// BlobCacheBytes is the byte budget for the in-memory LRU of whole blobs
 	// used to serve range reads of packed blocks. Defaults to
 	// defaultBlobCacheBytes; a negative value disables the cache.
@@ -250,6 +265,17 @@ func NewWalrusDatastore(conf Config) (*WalrusDatastore, error) {
 	if conf.PackFlushInterval <= 0 {
 		conf.PackFlushInterval = defaultPackFlushInterval
 	}
+	if conf.NodeID == "" {
+		host, err := os.Hostname()
+		if err != nil || host == "" {
+			return nil, fmt.Errorf("walrusds: node ID not configured and hostname unavailable; set Config.NodeID explicitly")
+		}
+		conf.NodeID = host
+		log.Printf("walrusds: nodeID not configured, using hostname %q — it must be stable across restarts or this node's staged blocks will wait out the takeover window", conf.NodeID)
+	}
+	if conf.StageTakeover <= 0 {
+		conf.StageTakeover = 2 * conf.PackMaxAge
+	}
 	// A negative BlobCacheBytes explicitly disables caching; zero means default.
 	cacheBytes := conf.BlobCacheBytes
 	switch {
@@ -261,7 +287,7 @@ func NewWalrusDatastore(conf Config) (*WalrusDatastore, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	index, err := newPostgresIndex(ctx, conf.PostgresURL, conf.Table, conf.MaxOpenConns)
+	index, err := newPostgresIndex(ctx, conf.PostgresURL, conf.Table, conf.NodeID, conf.StageTakeover, conf.MaxOpenConns)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -288,9 +314,9 @@ func NewWalrusDatastore(conf Config) (*WalrusDatastore, error) {
 	// silently caps pack size, so uploads split into extra blobs that each pay
 	// Walrus's fixed per-blob metadata overhead), and it is otherwise only
 	// observable by reverse-engineering blob sizes.
-	log.Printf("walrusds: packing config: packTargetSize=%d bytes, quilt=%t, packIdleFlush=%s, packMaxAge=%s, packFlushInterval=%s, workers=%d",
-		conf.PackTargetSize, !conf.DisableQuilt, conf.PackIdleFlush, conf.PackMaxAge,
-		conf.PackFlushInterval, conf.Workers)
+	log.Printf("walrusds: packing config: nodeID=%s, packTargetSize=%d bytes, quilt=%t, packIdleFlush=%s, packMaxAge=%s, packFlushInterval=%s, stageTakeover=%s, workers=%d",
+		conf.NodeID, conf.PackTargetSize, !conf.DisableQuilt, conf.PackIdleFlush, conf.PackMaxAge,
+		conf.PackFlushInterval, conf.StageTakeover, conf.Workers)
 
 	w.startFlushWorker(ctx)
 
@@ -313,8 +339,9 @@ func (w *WalrusDatastore) expiry() sql.NullTime {
 	}
 }
 
-// Put durably stages value in Postgres and returns; the background flusher
-// packs staged blocks from many Puts/Commits into full-size Walrus blobs.
+// Put durably stages value in Postgres and returns; this node's background
+// flusher packs the blocks it staged from many Puts/Commits into full-size
+// Walrus blobs (uploaded through this node's publisher, paid by its wallet).
 // Staging is what lets packs fill across commits: uploading synchronously per
 // Put/Commit produced one under-filled blob per commit, each paying Walrus's
 // fixed ~64 MB per-blob metadata overhead. A value too large to ever share a
@@ -526,8 +553,9 @@ type blockEntry struct {
 	val []byte
 }
 
-// Commit durably stages the buffered Puts in Postgres and applies the
-// buffered Deletes, then nudges the pack flusher. Blocks are NOT uploaded to
+// Commit durably stages the buffered Puts in Postgres (stamped with this
+// node's identity) and applies the buffered Deletes, then nudges this node's
+// pack flusher. Blocks are NOT uploaded to
 // Walrus here: a single Commit rarely carries enough bytes to fill a pack
 // (Kubo's importer commits every few MiB), and uploading per commit is what
 // produced thousands of under-filled blobs each paying Walrus's fixed ~64 MB
@@ -590,10 +618,12 @@ func (w *WalrusDatastore) kickFlusher() {
 }
 
 // startFlushWorker launches the background goroutine that turns staged blocks
-// into full-size Walrus packs. It runs on every node sharing the index; the
-// staging claim lease keeps concurrent flushers from packing the same blocks,
-// and a crashed flusher's lease simply expires (re-uploading is idempotent:
-// Walrus blob IDs are content-derived).
+// into full-size Walrus packs. Every node sharing the index runs one, but
+// each claims only the rows it staged itself (so uploads are paid by its own
+// wallet), plus foreign rows orphaned past StageTakeover. The claim lease
+// keeps concurrent flushers from packing the same blocks, and a crashed
+// flusher's lease simply expires (re-uploading is idempotent: Walrus blob
+// IDs are content-derived).
 func (w *WalrusDatastore) startFlushWorker(ctx context.Context) {
 	w.wg.Add(1)
 	go func() {
@@ -614,15 +644,18 @@ func (w *WalrusDatastore) startFlushWorker(ctx context.Context) {
 	}()
 }
 
-// flushStaged uploads staged blocks as packs while a pack is "ripe": a full
-// PackTargetSize of bytes has accumulated, no new blocks have arrived for
-// PackIdleFlush (the ingest finished, so its tail should reach Walrus now),
-// or the oldest staged block has waited PackMaxAge (backstop for continuous
-// trickle ingest). It claims up to Workers packs at a time (leasing them against
-// concurrent flushers) and uploads them in parallel; each pack is then
-// atomically moved from staging to the index. On upload failure the claim is
-// released for a later retry — the blocks stay durable in staging throughout.
-// Peak memory is bounded by Workers × PackTargetSize.
+// flushStaged uploads this node's staged blocks as packs while a pack is
+// "ripe": a full PackTargetSize of bytes has accumulated, no new blocks have
+// arrived for PackIdleFlush (the ingest finished, so its tail should reach
+// Walrus now), or the oldest staged block has waited PackMaxAge (backstop for
+// continuous trickle ingest). Stats and claims consider only rows this node
+// may claim (its own plus takeover-aged orphans), so other nodes' ingest
+// neither triggers nor delays these flushes. It claims up to Workers packs at
+// a time (leasing them against concurrent flushers) and uploads them in
+// parallel; each pack is then atomically moved from staging to the index. On
+// upload failure the claim is released for a later retry — the blocks stay
+// durable in staging throughout. Peak memory is bounded by
+// Workers × PackTargetSize.
 func (w *WalrusDatastore) flushStaged(ctx context.Context) {
 	maxCount := quiltMaxPatches
 	if w.conf.DisableQuilt {
