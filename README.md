@@ -206,7 +206,11 @@ existing data):
 ```
 
 Multiple nodes (e.g. an upload node and a retrieval node) share data by pointing the same
-`postgresURL`, `publisherURL`, and `aggregatorURL` at all of them.
+`postgresURL`, `publisherURL`, and `aggregatorURL` at all of them. **Run the pack flusher on
+one node only** (typically the upload node): set `disableFlush: true` on the others. Every
+node starts a flusher by default, and concurrent flushers race to claim the same staged
+blocks — a node that claims blocks and then dies or loses its publisher link holds them
+under its 15-minute claim lease, splitting what should be one quilt into several.
 
 ### Setting the config from the CLI / Dockerfile
 
@@ -273,6 +277,7 @@ Notes:
 | `packIdleFlushSeconds` | no | `30` | Once no new blocks have been staged for this long (the upload finished), the partial tail is flushed to Walrus immediately instead of waiting out `packMaxAgeSeconds`. Raise it if your ingest pauses between files and packing density matters more than tail latency. |
 | `packFlushIntervalSeconds` | no | `5` | How often the flusher re-checks the staging buffer (it is also kicked immediately after every commit). |
 | `disableQuilt` | no | `false` | When `true`, pack batches as legacy concatenated blobs (read by byte range) instead of Walrus quilts. Existing rows of either kind keep working regardless. |
+| `disableFlush` | no | `false` | Don't run this node's background pack flusher. On multi-node setups sharing one Postgres, keep the flusher on **one** node (the upload node) and set this on the rest — otherwise every node's flusher races to claim the same staged blocks, and a node that claims blocks then dies or loses its publisher link holds them under its 15-minute claim lease, splitting packs. Blocks staged here are still packed by the node that does flush (claims go through the shared staging table); reads are unaffected. |
 | `blobCacheBytes` | no | `1073741824` (1 GiB) | In-memory LRU budget for whole blobs, used to serve range reads of packed blocks. Per-entry cap is ¼ of this, so the default keeps a 256 MiB pack cacheable. A negative value disables the cache. |
 | `requestTimeoutSeconds` | no | `60` | Per-attempt Walrus HTTP timeout. |
 | `maxRetries` | no | `3` | Retries per Walrus request (exponential backoff). |

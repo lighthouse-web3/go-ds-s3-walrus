@@ -146,6 +146,16 @@ type Config struct {
 	// natively and are read back per-member by QuiltPatchID. Existing rows
 	// written under either scheme keep working regardless of this setting.
 	DisableQuilt bool
+	// DisableFlush turns off this node's background pack flusher. Every node
+	// sharing the Postgres index starts a flusher by default, so on multi-node
+	// deployments concurrent flushers race to claim the same staged blocks —
+	// and a node that claims blocks and then dies or loses its publisher link
+	// holds them under its claim lease (15 min), splitting what should be one
+	// quilt into several. Run the flusher on a single (upload) node and set
+	// this on retrieval-only nodes. Blocks staged by a flush-disabled node are
+	// still packed by whichever node does flush, since claims go through the
+	// shared staging table; reads/Has/GetSize are unaffected.
+	DisableFlush bool
 	// PackMaxAge bounds how long a block may wait in the Postgres staging
 	// buffer for a pack to fill before it is flushed to Walrus anyway.
 	// Blocks are durable from the moment they are staged; this only trades
@@ -278,7 +288,11 @@ func NewWalrusDatastore(conf Config) (*WalrusDatastore, error) {
 		cancel:    cancel,
 	}
 
-	w.startFlushWorker(ctx)
+	if conf.DisableFlush {
+		log.Printf("walrusds: pack flusher disabled (disableFlush); staged blocks are left for another node's flusher")
+	} else {
+		w.startFlushWorker(ctx)
+	}
 
 	if conf.RenewInterval > 0 && conf.EpochDuration > 0 {
 		w.startRenewalWorker(ctx)

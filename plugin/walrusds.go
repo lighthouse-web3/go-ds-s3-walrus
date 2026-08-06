@@ -61,6 +61,8 @@ func (WalrusPlugin) DatastoreTypeName() string {
 //     have arrived for this long — i.e. the upload finished, default 30)
 //   - "packFlushIntervalSeconds" (number; staging-buffer check interval, default 5)
 //   - "disableQuilt"          (bool;   pack batches as concatenated blobs instead of quilts)
+//   - "disableFlush"          (bool;   don't run this node's background pack flusher —
+//     set on retrieval-only nodes sharing the index so only the upload node packs)
 //   - "blobCacheBytes"        (number; LRU budget for range reads, default 1 GiB)
 //   - "epochDurationSeconds"  (number; wall-clock length of one epoch; enables renewal)
 //   - "renewIntervalSeconds"  (number; how often to scan for expiring blobs)
@@ -102,13 +104,21 @@ func (WalrusPlugin) DatastoreConfigParser() fsrepo.ConfigFromMap {
 			cfg.Deletable = b
 		}
 
-		if v, ok := m["disableQuilt"]; ok {
-			b, ok := v.(bool)
-			if !ok {
-				return nil, fmt.Errorf("walrusds: disableQuilt not a boolean")
-			}
-			cfg.DisableQuilt = b
+	if v, ok := m["disableQuilt"]; ok {
+		b, ok := v.(bool)
+		if !ok {
+			return nil, fmt.Errorf("walrusds: disableQuilt not a boolean")
 		}
+		cfg.DisableQuilt = b
+	}
+
+	if v, ok := m["disableFlush"]; ok {
+		b, ok := v.(bool)
+		if !ok {
+			return nil, fmt.Errorf("walrusds: disableFlush not a boolean")
+		}
+		cfg.DisableFlush = b
+	}
 
 		if cfg.Epochs, err = optionalPositiveInt(m, "epochs"); err != nil {
 			return nil, err

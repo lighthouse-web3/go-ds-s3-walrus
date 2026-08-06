@@ -83,6 +83,17 @@ We worked through several options before landing here:
   `PackTargetSize`); 1 MiB chunking (`Import.UnixFSChunker=size-1048576`, Kubo v0.40+) still
   helps by reducing block count. Walrus max blob size is 13.6 GiB; default pack target is
   256 MiB.
+- **One flusher per shared index.** New `disableFlush` config: a node with it set never
+  starts the background pack flusher. Retrieval-only nodes sharing the Postgres index should
+  set it — every node starts a flusher by default, and concurrent flushers race to claim the
+  same staged rows; a node that claims rows then dies/losses its publisher link strands them
+  under the 15-min `stageLease` (observed live: one ~50-block file split into 2 quilts,
+  ~29/~21, with a NULL/leased mix visible in staging; the stranded remnant flushed
+  immediately at lease expiry since it was already past idle/aged). Blocks staged by a
+  flush-disabled node are still packed by the node that does flush (shared staging table).
+  Related latent bug (not yet fixed): on `Close()`, `flushOnePack` releases claims with the
+  already-cancelled worker ctx, so even a graceful shutdown mid-upload strands leases —
+  release should use a fresh context.
 - **Epoch renewal — per distinct `blob_id`** (so a packed blob / quilt is renewed once, not once
   per block). Two mechanisms and two ways to drive them:
   - **Mechanisms:**

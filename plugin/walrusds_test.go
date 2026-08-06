@@ -119,6 +119,27 @@ func TestWalrusPluginDatastoreConfigParser(t *testing.T) {
 			},
 			HasErr: true,
 		},
+		{
+			Name: "disableFlush parses",
+			Input: map[string]interface{}{
+				"publisherURL": "p", "aggregatorURL": "a", "postgresURL": "d",
+				"disableFlush": true,
+			},
+			Want: &WalrusConfig{cfg: walrusds.Config{
+				PublisherURLs:  []string{"p"},
+				AggregatorURLs: []string{"a"},
+				PostgresURL:    "d",
+				DisableFlush:   true,
+			}},
+		},
+		{
+			Name: "disableFlush not a bool",
+			Input: map[string]interface{}{
+				"publisherURL": "p", "aggregatorURL": "a", "postgresURL": "d",
+				"disableFlush": "yes",
+			},
+			HasErr: true,
+		},
 	}
 
 	parser := WalrusPlugin{}.DatastoreConfigParser()
